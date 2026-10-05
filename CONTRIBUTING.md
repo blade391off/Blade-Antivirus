@@ -12,7 +12,7 @@ By submitting a Pull Request, you officially certify that you are not operating 
 
 ## 🛠️ Technical Requirements
 
-Blade-Antivirus is written in native C++ and is engineered for absolute performance and zero background overhead. We do not accept bloated code or modern AI dependencies.
+Blade-Antivirus is written in native C++ and is engineered for absolute performance and zero background overhead.
 
 To contribute, you must meet the following **minimum technical criteria**:
 1. **Basic C++ knowledge and a willingness to learn:** You must understand the fundamentals of modern C++ (at least the basic principles of C++17, working with pointers and references, and memory management using RAII). A willingness to revise your code based on feedback from senior developers is required.
