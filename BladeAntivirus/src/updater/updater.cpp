@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <cctype>
@@ -16,8 +17,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <iomanip>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace
 {
@@ -168,6 +171,66 @@ namespace
         return ipPort.substr(0, colon);
     }
 
+    std::string Sha256String(const std::string& input)
+    {
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        DWORD objectSize = 0;
+        DWORD hashSize = 0;
+        DWORD resultSize = 0;
+
+        if (BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
+            return {};
+
+        if (BCryptGetProperty(
+            algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectSize),
+            sizeof(objectSize), &resultSize, 0) < 0 ||
+            BCryptGetProperty(
+            algorithm, BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashSize),
+            sizeof(hashSize), &resultSize, 0) < 0)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return {};
+        }
+
+        std::vector<UCHAR> object(objectSize);
+        std::vector<UCHAR> digest(hashSize);
+
+        NTSTATUS status = BCryptCreateHash(
+            algorithm, &hash, object.data(), objectSize,
+            nullptr, 0, 0);
+
+    if (status >= 0 && !input.empty())
+        status = BCryptHashData(
+            hash,
+            reinterpret_cast<PUCHAR>(
+                const_cast<char*>(input.data())),
+            static_cast<ULONG>(input.size()), 0);
+
+        if (status >= 0)
+            status = BCryptFinishHash(
+                hash, digest.data(), hashSize, 0);
+
+        if (hash)
+            BCryptDestroyHash(hash);
+
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+
+        if (status < 0)
+            return {};
+
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+
+        for (UCHAR byte : digest)
+            output << std::setw(2) << static_cast<unsigned>(byte);
+
+        return output.str();
+    }
+
     bool NormalizeFeed(
         const std::string& input,
         FeedType type,
@@ -219,8 +282,13 @@ namespace
                 if (!IsUrl(line))
                     continue;
 
-                if (uniqueEntries.insert(line).second)
-                    entries.push_back(line);
+                const std::string hash = Sha256String(line);
+
+                if (hash.empty())
+                    continue;
+
+                if (uniqueEntries.insert(hash).second)
+                    entries.push_back(hash);
             }
             else if (type == FeedIpPort)
             {
