@@ -1,93 +1,45 @@
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
 #include <windows.h>
 #include <commdlg.h>
-#include <windowsx.h>
+#include <d3d11.h>
+#include <dxgi.h>
 
-#include <string>
-#include <sstream>
-#include <iomanip>
+#include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <system_error>
 #include <fstream>
+#include <map>
+#include <ctime>
+
+#include "imgui.h"
+#include "backends/imgui_impl_win32.h"
+#include "backends/imgui_impl_dx11.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam
+);
 
 #include "scanner/scanner.h"
 #include "signs/signs.hpp"
 #include "updater/updater.h"
 
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "comdlg32.lib")
 
 namespace
 {
-    constexpr wchar_t WINDOW_CLASS[] = L"BladeAntivirusMainWindow";
-    constexpr wchar_t BUTTON_CLASS[] = L"BladeAntivirusButton";
-    constexpr wchar_t PANEL_CLASS[] = L"BladeAntivirusPanel";
-
-    constexpr int ID_NAV_DASHBOARD = 1001;
-    constexpr int ID_NAV_SCANNER = 1002;
-    constexpr int ID_NAV_UPDATES = 1003;
-    constexpr int ID_NAV_ABOUT = 1004;
-
-    constexpr int ID_SCAN_NOW = 1010;
-    constexpr int ID_SELECT_FILE = 1011;
-    constexpr int ID_SCAN_FILE = 1012;
-    constexpr int ID_CHECK_UPDATE = 1013;
-
-    constexpr UINT WM_BLADE_ACTIVE = WM_USER + 10;
-
-    constexpr int SIDEBAR_WIDTH = 245;
-    constexpr int FOOTER_HEIGHT = 34;
-
-    // Color definitions
-#define COLOR_BACKGROUND RGB(11, 12, 15)
-#define COLOR_SIDEBAR RGB(15, 16, 20)
-#define COLOR_PANEL RGB(21, 23, 28)
-#define COLOR_PANEL_ALT RGB(26, 28, 34)
-#define COLOR_BUTTON RGB(28, 30, 37)
-#define COLOR_BUTTON_HOV RGB(37, 40, 49)
-#define COLOR_BORDER RGB(45, 48, 57)
-
-#define COLOR_TEXT RGB(245, 247, 250)
-#define COLOR_MUTED RGB(155, 161, 172)
-#define COLOR_DIM RGB(105, 111, 123)
-
-#define COLOR_ACCENT RGB(48, 125, 255)
-#define COLOR_ACCENT_HOV RGB(67, 141, 255)
-
-#define COLOR_GREEN RGB(56, 201, 117)
-#define COLOR_RED RGB(230, 79, 79)
-#define COLOR_YELLOW RGB(238, 184, 72)
-
-    HINSTANCE g_instance = nullptr;
-
-    HWND g_mainWindow = nullptr;
-    HWND g_sidebar = nullptr;
-    HWND g_content = nullptr;
-    HWND g_footer = nullptr;
-
-    HWND g_navDashboard = nullptr;
-    HWND g_navScanner = nullptr;
-    HWND g_navUpdates = nullptr;
-    HWND g_navAbout = nullptr;
-
-    HWND g_filePath = nullptr;
-    HWND g_result = nullptr;
-    HWND g_scanStatus = nullptr;
-    HWND g_updateStatus = nullptr;
-
-    std::wstring g_currentFile;
-
-    HFONT g_font = nullptr;
-    HFONT g_fontSmall = nullptr;
-    HFONT g_fontMedium = nullptr;
-    HFONT g_fontBold = nullptr;
-    HFONT g_fontTitle = nullptr;
-    HFONT g_fontBig = nullptr;
-    HFONT g_fontHuge = nullptr;
-    HFONT g_fontMono = nullptr;
-
-    HBRUSH g_backgroundBrush = nullptr;
-    HBRUSH g_sidebarBrush = nullptr;
-    HBRUSH g_panelBrush = nullptr;
-    HBRUSH g_panelAltBrush = nullptr;
-    HBRUSH g_editBrush = nullptr;
+    constexpr wchar_t WINDOW_CLASS[] = L"BladeAntivirusImGuiWindow";
 
     enum class Page
     {
@@ -97,2782 +49,1284 @@ namespace
         About
     };
 
-    Page g_currentPage = Page::Dashboard;
-
-    struct ButtonState
+    struct ScanState
     {
-        bool hover = false;
-        bool pressed = false;
-        bool active = false;
-        bool tracking = false;
-        HFONT font = nullptr;
+        ScanResult scan{};
+        SignsResult signs{};
+        std::string error;
+        bool valid = false;
+        bool detected = false;
     };
 
-    std::wstring ToWide(const std::string& value)
+    ID3D11Device* g_device = nullptr;
+    ID3D11DeviceContext* g_context = nullptr;
+    IDXGISwapChain* g_swapChain = nullptr;
+    ID3D11RenderTargetView* g_renderTarget = nullptr;
+
+    HWND g_window = nullptr;
+    Page g_page = Page::Dashboard;
+
+    std::wstring g_selectedPath;
+    std::string g_selectedPathForEngine;
+    std::string g_databasePath;
+    std::string g_urlPath;
+    std::string g_ipPath;
+    std::string g_updateStatePath;
+
+    std::mutex g_stateMutex;
+    ScanState g_scanState;
+    std::string g_scanStatus = "Ready to scan";
+    std::string g_updateStatus = "Updates are not configured";
+
+    std::atomic<bool> g_scanning{ false };
+    std::atomic<bool> g_updating{ false };
+
+    std::thread g_scanThread;
+    std::thread g_updateThread;
+
+    bool g_imguiInitialized = false;
+
+    std::string WideToUtf8(const std::wstring& value)
     {
         if (value.empty())
-            return L"";
+            return {};
 
-        int size = MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            value.data(),
+        const int size = WideCharToMultiByte(
+            CP_UTF8, 0, value.data(),
             static_cast<int>(value.size()),
-            nullptr,
-            0
-        );
+            nullptr, 0, nullptr, nullptr);
 
         if (size <= 0)
-            return L"";
+            return {};
 
-        std::wstring result(size, L'\0');
-
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            result.data(),
-            size
-        );
-
-        return result;
-    }
-
-    std::string ToNarrow(const std::wstring& value)
-    {
-        if (value.empty())
-            return "";
-
-        int size = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (size <= 0)
-            return "";
-
-        std::string result(size, '\0');
+        std::string result(static_cast<size_t>(size), '\0');
 
         WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
+            CP_UTF8, 0, value.data(),
             static_cast<int>(value.size()),
-            result.data(),
-            size,
-            nullptr,
-            nullptr
-        );
+            result.data(), size, nullptr, nullptr);
 
         return result;
     }
 
-    void SetText(HWND hwnd, const std::wstring& text)
+    std::string WideToAnsi(const std::wstring& value)
     {
-        if (hwnd)
-            SetWindowTextW(hwnd, text.c_str());
-    }
+        if (value.empty())
+            return {};
 
-    void SetLabelColor(HWND hwnd, COLORREF color)
-    {
-        if (!hwnd)
-            return;
+        const int size = WideCharToMultiByte(
+            CP_ACP, 0, value.data(),
+            static_cast<int>(value.size()),
+            nullptr, 0, nullptr, nullptr);
 
-        SetPropW(
-            hwnd,
-            L"BladeTextColor",
-            reinterpret_cast<HANDLE>(
-                static_cast<ULONG_PTR>(color)
-                )
-        );
+        if (size <= 0)
+            return {};
 
-        InvalidateRect(hwnd, nullptr, TRUE);
-    }
+        std::string result(static_cast<size_t>(size), '\0');
 
-    HFONT CreateBladeFont(
-        int height,
-        int weight = FW_NORMAL,
-        const wchar_t* face = L"Segoe UI"
-    )
-    {
-        return CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            weight,
-            FALSE,
-            FALSE,
-            FALSE,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
-            face
-        );
-    }
+        WideCharToMultiByte(
+            CP_ACP, 0, value.data(),
+            static_cast<int>(value.size()),
+            result.data(), size, nullptr, nullptr);
 
-    HWND CreateLabel(
-        HWND parent,
-        const std::wstring& text,
-        int x,
-        int y,
-        int width,
-        int height,
-        HFONT font = nullptr,
-        COLORREF color = COLOR_TEXT
-    )
-    {
-        HWND hwnd = CreateWindowExW(
-            0,
-            L"STATIC",
-            text.c_str(),
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-            x,
-            y,
-            width,
-            height,
-            parent,
-            nullptr,
-            g_instance,
-            nullptr
-        );
-
-        if (hwnd)
-        {
-            SendMessageW(
-                hwnd,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(font ? font : g_font),
-                TRUE
-            );
-
-            SetLabelColor(hwnd, color);
-        }
-
-        return hwnd;
-    }
-
-    HWND CreateBladePanel(
-        HWND parent,
-        int x,
-        int y,
-        int width,
-        int height,
-        COLORREF background
-    )
-    {
-        return CreateWindowExW(
-            0,
-            PANEL_CLASS,
-            L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-            x,
-            y,
-            width,
-            height,
-            parent,
-            nullptr,
-            g_instance,
-            reinterpret_cast<LPVOID>(&background)
-        );
-    }
-
-    HWND CreateBladeButton(
-        HWND parent,
-        int id,
-        const std::wstring& text,
-        int x,
-        int y,
-        int width,
-        int height,
-        bool active = false
-    )
-    {
-        HWND hwnd = CreateWindowExW(
-            0,
-            BUTTON_CLASS,
-            text.c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            x,
-            y,
-            width,
-            height,
-            parent,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-            g_instance,
-            nullptr
-        );
-
-        if (hwnd)
-        {
-            SendMessageW(
-                hwnd,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(g_fontMedium),
-                TRUE
-            );
-
-            SendMessageW(
-                hwnd,
-                WM_BLADE_ACTIVE,
-                active ? 1 : 0,
-                0
-            );
-        }
-
-        return hwnd;
-    }
-
-    void DestroyContentChildren()
-    {
-        if (!g_content)
-            return;
-
-        HWND child = GetWindow(g_content, GW_CHILD);
-
-        while (child)
-        {
-            HWND next = GetWindow(child, GW_HWNDNEXT);
-            DestroyWindow(child);
-            child = next;
-        }
-
-        g_filePath = nullptr;
-        g_result = nullptr;
-        g_scanStatus = nullptr;
-        g_updateStatus = nullptr;
-    }
-
-    void SetActiveNavigation(Page page)
-    {
-        g_currentPage = page;
-
-        SendMessageW(
-            g_navDashboard,
-            WM_BLADE_ACTIVE,
-            page == Page::Dashboard,
-            0
-        );
-
-        SendMessageW(
-            g_navScanner,
-            WM_BLADE_ACTIVE,
-            page == Page::Scanner,
-            0
-        );
-
-        SendMessageW(
-            g_navUpdates,
-            WM_BLADE_ACTIVE,
-            page == Page::Updates,
-            0
-        );
-
-        SendMessageW(
-            g_navAbout,
-            WM_BLADE_ACTIVE,
-            page == Page::About,
-            0
-        );
-    }
-
-    void ShowDashboard();
-    void ShowScanner();
-    void ShowUpdates();
-    void ShowAbout();
-
-    void Navigate(Page page)
-    {
-        switch (page)
-        {
-        case Page::Dashboard:
-            ShowDashboard();
-            break;
-
-        case Page::Scanner:
-            ShowScanner();
-            break;
-
-        case Page::Updates:
-            ShowUpdates();
-            break;
-
-        case Page::About:
-            ShowAbout();
-            break;
-        }
-
-        SetActiveNavigation(page);
+        return result;
     }
 
     std::wstring GetExecutableDirectory()
     {
-        wchar_t buffer[MAX_PATH]{};
+        wchar_t buffer[32768]{};
 
-        DWORD length = GetModuleFileNameW(
-            nullptr,
-            buffer,
-            MAX_PATH
-        );
+        const DWORD length = GetModuleFileNameW(
+            nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
 
-        if (length == 0)
+        if (length == 0 || length >= std::size(buffer))
             return L".";
 
-        std::filesystem::path path(buffer);
-
-        return path.parent_path().wstring();
+        return std::filesystem::path(buffer).parent_path().wstring();
     }
 
-    std::string ResolveDatabasePath()
+    std::filesystem::path FindDatabaseFile(const wchar_t* filename)
     {
-        std::filesystem::path exeDir(GetExecutableDirectory());
+        const std::filesystem::path executableDir(
+            GetExecutableDirectory());
 
-        std::filesystem::path candidates[] =
+        const std::filesystem::path candidates[] =
         {
-            exeDir / L"database" / L"hashes.txt",
-            exeDir / L"..\\..\\..\\database\\hashes.txt",
-            std::filesystem::current_path() / L"database" / L"hashes.txt"
+            executableDir / L"database" / filename,
+            executableDir / L"..\\..\\..\\database" / filename,
+            std::filesystem::current_path() / L"database" / filename
         };
 
         for (const auto& candidate : candidates)
         {
             std::error_code ec;
 
-            if (std::filesystem::exists(candidate, ec))
+            if (std::filesystem::is_regular_file(candidate, ec))
             {
-                return ToNarrow(
-                    std::filesystem::weakly_canonical(candidate, ec).wstring()
-                );
+                auto resolved =
+                    std::filesystem::weakly_canonical(candidate, ec);
+
+                if (!ec)
+                    return resolved;
+
+                return candidate;
             }
         }
 
-        return ToNarrow(
-            (std::filesystem::current_path() /
-                L"database" /
-                L"hashes.txt").wstring()
-        );
+        return std::filesystem::path(GetExecutableDirectory())
+            / L"database" / filename;
     }
 
-    std::string ResolveVersionPath()
+    std::string GetDatabasePath()
     {
-        std::filesystem::path exeDir(GetExecutableDirectory());
+        return WideToAnsi(FindDatabaseFile(L"hashes.txt").wstring());
+    }
 
-        std::filesystem::path candidates[] =
+    std::string GetUrlDatabasePath()
+    {
+        return WideToAnsi(FindDatabaseFile(L"url.txt").wstring());
+    }
+
+    std::string GetIpDatabasePath()
+    {
+        return WideToAnsi(FindDatabaseFile(L"ip.txt").wstring());
+    }
+
+    std::string GetUpdateStatePath()
+    {
+        return WideToAnsi(
+            FindDatabaseFile(L"update_state.txt").wstring());
+    }
+
+    std::map<std::string, long long> LoadUpdateState(const std::string& statePath)
+    {
+        std::map<std::string, long long> state;
+        std::ifstream file(statePath);
+
+        std::string key;
+        long long timestamp = 0;
+
+        while (file >> key >> timestamp)
+            state[key] = timestamp;
+
+        return state;
+    }
+
+    bool UpdatesDue()
+    {
+        constexpr long long UPDATE_INTERVAL_SECONDS = 86100; // 23h55m
+
+        const auto state = LoadUpdateState(g_updateStatePath);
+        const long long now = static_cast<long long>(std::time(nullptr));
+
+        const char* keys[] = { "sha256", "urlhaus", "threatfox" };
+
+        for (const char* key : keys)
         {
-            exeDir / L"database" / L"version.txt",
-            exeDir / L"..\\..\\..\\database\\version.txt",
-            std::filesystem::current_path() / L"database" / L"version.txt"
-        };
+            const auto it = state.find(key);
 
-        for (const auto& candidate : candidates)
-        {
-            std::error_code ec;
+            if (it == state.end())
+                return true; // no record -> due
 
-            if (std::filesystem::exists(candidate, ec))
-            {
-                return ToNarrow(
-                    std::filesystem::weakly_canonical(candidate, ec).wstring()
-                );
-            }
+            if (now - it->second >= UPDATE_INTERVAL_SECONDS)
+                return true; // due
         }
 
-        return ToNarrow(
-            (std::filesystem::current_path() /
-                L"database" /
-                L"version.txt").wstring()
-        );
+        return false; // none due
+    }
+
+    void SetScanStatus(const std::string& status)
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        g_scanStatus = status;
+    }
+
+    void SetUpdateStatus(const std::string& status)
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        g_updateStatus = status;
+    }
+
+    std::string GetScanStatus()
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        return g_scanStatus;
+    }
+
+    std::string GetUpdateStatus()
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        return g_updateStatus;
+    }
+
+    ScanState GetScanState()
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        return g_scanState;
+    }
+
+    bool CreateRenderTarget()
+    {
+        ID3D11Texture2D* backBuffer = nullptr;
+
+        const HRESULT result = g_swapChain->GetBuffer(
+            0, IID_PPV_ARGS(&backBuffer));
+
+        if (FAILED(result))
+            return false;
+
+        const HRESULT viewResult = g_device->CreateRenderTargetView(
+            backBuffer, nullptr, &g_renderTarget);
+
+        backBuffer->Release();
+
+        return SUCCEEDED(viewResult);
+    }
+
+    void CleanupRenderTarget()
+    {
+        if (g_renderTarget)
+        {
+            g_renderTarget->Release();
+            g_renderTarget = nullptr;
+        }
+    }
+
+    bool CreateDeviceD3D(HWND hwnd)
+    {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        desc.BufferCount = 2;
+        desc.BufferDesc.Width = 0;
+        desc.BufferDesc.Height = 0;
+        desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.BufferDesc.RefreshRate.Numerator = 60;
+        desc.BufferDesc.RefreshRate.Denominator = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.OutputWindow = hwnd;
+        desc.SampleDesc.Count = 1;
+        desc.Windowed = TRUE;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+        const D3D_FEATURE_LEVEL levels[] =
+        {
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_0
+        };
+
+        D3D_FEATURE_LEVEL selectedLevel{};
+
+        HRESULT result = D3D11CreateDeviceAndSwapChain(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            0,
+            levels,
+            static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION,
+            &desc,
+            &g_swapChain,
+            &g_device,
+            &selectedLevel,
+            &g_context);
+
+        if (result == DXGI_ERROR_UNSUPPORTED)
+        {
+            result = D3D11CreateDeviceAndSwapChain(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                0,
+                levels,
+                static_cast<UINT>(std::size(levels)),
+                D3D11_SDK_VERSION,
+                &desc,
+                &g_swapChain,
+                &g_device,
+                &selectedLevel,
+                &g_context);
+        }
+
+        if (FAILED(result))
+            return false;
+
+        return CreateRenderTarget();
+    }
+
+    void CleanupDeviceD3D()
+    {
+        CleanupRenderTarget();
+
+        if (g_swapChain)
+        {
+            g_swapChain->Release();
+            g_swapChain = nullptr;
+        }
+
+        if (g_context)
+        {
+            g_context->Release();
+            g_context = nullptr;
+        }
+
+        if (g_device)
+        {
+            g_device->Release();
+            g_device = nullptr;
+        }
+    }
+
+    void ApplyStyle()
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+
+        style.WindowRounding = 10.0f;
+        style.ChildRounding = 10.0f;
+        style.FrameRounding = 7.0f;
+        style.PopupRounding = 8.0f;
+        style.ScrollbarRounding = 8.0f;
+        style.GrabRounding = 7.0f;
+        style.TabRounding = 7.0f;
+
+        style.WindowPadding = ImVec2(20.0f, 20.0f);
+        style.FramePadding = ImVec2(13.0f, 10.0f);
+        style.ItemSpacing = ImVec2(10.0f, 10.0f);
+        style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+
+        ImVec4* colors = style.Colors;
+
+        colors[ImGuiCol_Text] = ImVec4(0.94f, 0.95f, 0.97f, 1.00f);
+        colors[ImGuiCol_TextDisabled] = ImVec4(0.48f, 0.51f, 0.57f, 1.00f);
+        colors[ImGuiCol_WindowBg] = ImVec4(0.043f, 0.047f, 0.059f, 1.00f);
+        colors[ImGuiCol_ChildBg] = ImVec4(0.063f, 0.071f, 0.086f, 1.00f);
+        colors[ImGuiCol_PopupBg] = ImVec4(0.075f, 0.082f, 0.098f, 1.00f);
+        colors[ImGuiCol_Border] = ImVec4(0.15f, 0.17f, 0.20f, 1.00f);
+        colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.11f, 0.14f, 1.00f);
+        colors[ImGuiCol_FrameBgHovered] = ImVec4(0.14f, 0.16f, 0.20f, 1.00f);
+        colors[ImGuiCol_FrameBgActive] = ImVec4(0.17f, 0.19f, 0.24f, 1.00f);
+        colors[ImGuiCol_Button] = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
+        colors[ImGuiCol_ButtonHovered] = ImVec4(0.15f, 0.19f, 0.26f, 1.00f);
+        colors[ImGuiCol_ButtonActive] = ImVec4(0.18f, 0.23f, 0.32f, 1.00f);
+        colors[ImGuiCol_Header] = ImVec4(0.11f, 0.15f, 0.22f, 1.00f);
+        colors[ImGuiCol_HeaderHovered] = ImVec4(0.13f, 0.18f, 0.27f, 1.00f);
+        colors[ImGuiCol_HeaderActive] = ImVec4(0.15f, 0.21f, 0.32f, 1.00f);
+        colors[ImGuiCol_CheckMark] = ImVec4(0.20f, 0.51f, 1.00f, 1.00f);
+        colors[ImGuiCol_SliderGrab] = ImVec4(0.20f, 0.51f, 1.00f, 1.00f);
+        colors[ImGuiCol_SliderGrabActive] = ImVec4(0.34f, 0.60f, 1.00f, 1.00f);
+        colors[ImGuiCol_Separator] = ImVec4(0.15f, 0.17f, 0.20f, 1.00f);
+        colors[ImGuiCol_ScrollbarBg] = ImVec4(0.04f, 0.05f, 0.07f, 1.00f);
+        colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.20f, 0.22f, 0.27f, 1.00f);
     }
 
     void SelectFile()
     {
-        if (!g_filePath)
-            return;
+        OPENFILENAMEW dialog{};
+        wchar_t fileName[32768]{};
 
-        OPENFILENAMEW ofn{};
-        wchar_t fileName[MAX_PATH]{};
-
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = g_mainWindow;
-        ofn.lpstrFile = fileName;
-        ofn.nMaxFile = MAX_PATH;
-
-        ofn.lpstrFilter =
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = g_window;
+        dialog.lpstrFile = fileName;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(fileName));
+        dialog.lpstrFilter =
             L"Executable files (*.exe;*.dll)\0*.exe;*.dll\0"
             L"All files (*.*)\0*.*\0";
-
-        ofn.nFilterIndex = 1;
-        ofn.Flags =
+        dialog.nFilterIndex = 1;
+        dialog.Flags = OFN_FILEMUSTEXIST |
             OFN_PATHMUSTEXIST |
-            OFN_FILEMUSTEXIST |
             OFN_NOCHANGEDIR;
 
-        if (GetOpenFileNameW(&ofn))
+        if (GetOpenFileNameW(&dialog))
         {
-            g_currentFile = fileName;
-            SetText(g_filePath, g_currentFile);
+            g_selectedPath = fileName;
+            g_selectedPathForEngine = WideToAnsi(g_selectedPath);
 
-            if (g_scanStatus)
             {
-                SetText(
-                    g_scanStatus,
-                    L"Ready to scan"
-                );
-
-                SetLabelColor(
-                    g_scanStatus,
-                    COLOR_MUTED
-                );
-            }
-
-            if (g_result)
-            {
-                SetText(
-                    g_result,
-                    L"Select a file and press SCAN FILE."
-                );
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                g_scanStatus = "File selected. Ready to scan.";
+                g_scanState = ScanState{};
             }
         }
     }
 
-    std::wstring BuildScanResult(
-        const ScanResult& scan,
-        const SignsResult& signs
-    )
+    void StartScan()
     {
-        std::wstringstream output;
+        if (g_scanning.load())
+            return;
 
-        output
-            << L"BLADEANTIVIRUS SCAN RESULT\n"
-            << L"========================================\n\n";
-
-        output
-            << L"File:\n"
-            << g_currentFile
-            << L"\n\n";
-
-        output
-            << L"HASH ENGINE\n"
-            << L"----------------------------------------\n";
-
-        output
-            << L"Hash match: "
-            << (scan.hashMatch ? L"MATCH" : L"NO MATCH")
-            << L"\n";
-
-        output
-            << L"PE file: "
-            << (scan.isPE ? L"YES" : L"NO")
-            << L"\n";
-
-        if (!scan.verdict.empty())
+        if (g_selectedPath.empty())
         {
-            output
-                << L"Engine verdict: "
-                << ToWide(scan.verdict)
-                << L"\n";
+            SetScanStatus("Select a file before starting the scan.");
+            return;
         }
 
-        output
-            << L"\nSTATIC SIGNS\n"
-            << L"----------------------------------------\n";
+        if (g_scanThread.joinable())
+            g_scanThread.join();
 
-        output
-            << L"Score: "
-            << signs.score
-            << L"\n";
+        const std::string filePath = g_selectedPathForEngine;
+        const std::string databasePath = g_databasePath;
 
-        output << L"Matches:\n";
-
-        if (signs.matches.empty())
         {
-            output << L"None\n";
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            g_scanStatus = "Scanning file...";
+            g_scanState = ScanState{};
+        }
+
+        g_scanning.store(true);
+
+        g_scanThread = std::thread([filePath, databasePath]()
+            {
+                ScanState result;
+
+                try
+                {
+                    Scanner scanner;
+
+                    if (!scanner.initialize(databasePath))
+                    {
+                        result.error =
+                            "Could not initialize the hash scanner. "
+                            "Check that database/hashes.txt exists and is readable.";
+                    }
+                    else
+                    {
+                        result.scan = scanner.scan(filePath);
+
+                        SignsEngine engine;
+                        result.signs = engine.analyze(filePath);
+
+                        result.detected =
+                            result.scan.hashMatch ||
+                            result.signs.verdict == "MALICIOUS" ||
+                            result.signs.verdict == "SUSPICIOUS";
+
+                        result.valid = true;
+                    }
+                }
+                catch (const std::exception& ex)
+                {
+                    result.error = std::string("Scan failed: ") + ex.what();
+                }
+                catch (...)
+                {
+                    result.error = "Scan failed due to an unexpected error.";
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(g_stateMutex);
+                    g_scanState = std::move(result);
+
+                    if (!g_scanState.error.empty())
+                        g_scanStatus = "Scan failed";
+                    else if (g_scanState.detected)
+                        g_scanStatus = "Suspicious indicators found";
+                    else
+                        g_scanStatus = "Scan completed";
+                }
+
+                g_scanning.store(false);
+            });
+    }
+
+    void StartUpdate(bool force = false)
+    {
+        if (g_updating.load())
+            return;
+
+        if (g_updateThread.joinable())
+            g_updateThread.join();
+
+        const std::string sha256Path = g_databasePath;
+        const std::string urlPath = g_urlPath;
+        const std::string ipPath = g_ipPath;
+        const std::string statePath = g_updateStatePath;
+
+        SetUpdateStatus("Checking update schedule...");
+        g_updating.store(true);
+
+        g_updateThread = std::thread(
+            [sha256Path, urlPath, ipPath, statePath, force]()
+            {
+                std::string status;
+
+                try
+                {
+                    Updater updater;
+
+                    updater.updateFeeds(
+                        sha256Path,
+                        urlPath,
+                        ipPath,
+                        statePath,
+                        status,
+                        force);
+                }
+                catch (const std::exception& ex)
+                {
+                    status = std::string("Update failed: ") + ex.what();
+                }
+                catch (...)
+                {
+                    status = "Update failed due to an unexpected error.";
+                }
+
+                if (status.empty())
+                    status = "Updater finished without a status.";
+
+                SetUpdateStatus(status);
+                g_updating.store(false);
+            });
+    }
+
+    bool NavButton(const char* label, Page page)
+    {
+        const bool active = g_page == page;
+
+        if (active)
+        {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button,
+                ImVec4(0.12f, 0.20f, 0.34f, 1.0f));
+
+            ImGui::PushStyleColor(
+                ImGuiCol_ButtonHovered,
+                ImVec4(0.15f, 0.23f, 0.38f, 1.0f));
+        }
+
+        const bool clicked = ImGui::Button(label, ImVec2(-1.0f, 44.0f));
+
+        if (active)
+            ImGui::PopStyleColor(2);
+
+        if (clicked)
+            g_page = page;
+
+        return clicked;
+    }
+
+    void DrawSidebar()
+    {
+        ImGui::BeginChild(
+            "Sidebar",
+            ImVec2(225.0f, 0.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+        ImGui::TextColored(
+            ImVec4(0.24f, 0.53f, 1.0f, 1.0f),
+            "BLADE");
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("ANTIVIRUS");
+
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0.0f, 12.0f));
+
+        NavButton("Dashboard", Page::Dashboard);
+        NavButton("Scanner", Page::Scanner);
+        NavButton("Updates", Page::Updates);
+        NavButton("About", Page::About);
+
+        ImGui::SetCursorPosY(
+            ImGui::GetWindowHeight() - 115.0f);
+
+        ImGui::Separator();
+        ImGui::TextDisabled("DETECTION ENGINES");
+        ImGui::BulletText("SHA-256 database");
+        ImGui::BulletText("Static signs");
+        ImGui::BulletText("PE inspection");
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::TextColored(
+            ImVec4(0.94f, 0.70f, 0.25f, 1.0f),
+            "Manual scanning only");
+
+        ImGui::EndChild();
+    }
+
+    void DrawDashboard()
+    {
+        ImGui::TextDisabled("SECURITY OVERVIEW");
+        ImGui::Spacing();
+        ImGui::Text("Dashboard");
+        ImGui::TextWrapped(
+            "Inspect a file locally with the available detection engines.");
+
+        ImGui::Dummy(ImVec2(0.0f, 12.0f));
+
+        ImGui::BeginChild(
+            "ProtectionCard",
+            ImVec2(0.0f, 155.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextColored(
+            ImVec4(0.30f, 0.68f, 1.0f, 1.0f),
+            "BLADEANTIVIRUS");
+
+        ImGui::Spacing();
+        ImGui::Text("Manual scan engine");
+        ImGui::TextDisabled(
+            "SHA-256 matching, PE inspection and static indicators");
+
+        ImGui::Spacing();
+
+        ImGui::TextColored(
+            ImVec4(0.95f, 0.72f, 0.26f, 1.0f),
+            "Real-time protection is not enabled");
+
+        ImGui::TextDisabled(
+            "This application does not currently block files in the background.");
+
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::Text("Detection engines");
+
+        const float available = ImGui::GetContentRegionAvail().x;
+        const float gap = 10.0f;
+        const float cardWidth = (available - gap * 2.0f) / 3.0f;
+
+        ImGui::BeginChild(
+            "HashCard",
+            ImVec2(cardWidth, 105.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextDisabled("HASH DATABASE");
+        ImGui::Spacing();
+        ImGui::Text("SHA-256");
+        ImGui::TextDisabled("Local indicators");
+
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginChild(
+            "SignsCard",
+            ImVec2(cardWidth, 105.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextDisabled("STATIC SIGNS");
+        ImGui::Spacing();
+        ImGui::Text("Heuristics");
+        ImGui::TextDisabled("Potential indicators");
+
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginChild(
+            "PeCard",
+            ImVec2(cardWidth, 105.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextDisabled("FILE FORMAT");
+        ImGui::Spacing();
+        ImGui::Text("PE analysis");
+        ImGui::TextDisabled("Executable inspection");
+
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::Text("Quick action");
+
+        if (ImGui::Button("Select file and scan", ImVec2(240.0f, 46.0f)))
+        {
+            SelectFile();
+
+            if (!g_selectedPath.empty())
+            {
+                g_page = Page::Scanner;
+                StartScan();
+            }
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Open scanner", ImVec2(180.0f, 46.0f)))
+            g_page = Page::Scanner;
+    }
+
+    void DrawScanner()
+    {
+        ImGui::TextDisabled("LOCAL FILE ANALYSIS");
+        ImGui::Spacing();
+        ImGui::Text("Scanner");
+        ImGui::TextWrapped(
+            "Select an executable or another file to inspect it.");
+
+        ImGui::Spacing();
+
+        ImGui::BeginChild(
+            "TargetCard",
+            ImVec2(0.0f, 145.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextDisabled("TARGET FILE");
+        ImGui::Spacing();
+
+        const std::string displayPath =
+            g_selectedPath.empty()
+            ? "No file selected"
+            : WideToUtf8(g_selectedPath);
+
+        ImGui::TextWrapped("%s", displayPath.c_str());
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("Select file", ImVec2(150.0f, 40.0f)))
+            SelectFile();
+
+        ImGui::SameLine();
+
+        if (g_scanning.load())
+        {
+            ImGui::BeginDisabled();
+            ImGui::Button("Scanning...", ImVec2(170.0f, 40.0f));
+            ImGui::EndDisabled();
         }
         else
         {
-            for (const auto& m : signs.matches)
-            {
-                output
-                    << L"- "
-                    << ToWide(m.name)
-                    << L"  (+" << m.score << L")\n"
-                    << ToWide(m.description)
-                    << L"\n";
-            }
+            if (ImGui::Button("Scan file", ImVec2(170.0f, 40.0f)))
+                StartScan();
         }
 
-        output
-            << L"\nFINAL VERDICT\n"
-            << L"----------------------------------------\n";
+        ImGui::EndChild();
 
-        if (scan.hashMatch ||
-            signs.verdict == "MALICIOUS" ||
-            signs.verdict == "SUSPICIOUS")
+        ImGui::Spacing();
+
+        const std::string status = GetScanStatus();
+
+        ImGui::Text("Status:");
+        ImGui::SameLine();
+
+        if (g_scanning.load())
         {
-            output
-                << L"THREAT DETECTED\n"
-                << L"\nBladeAntivirus detected a suspicious indicator.";
+            ImGui::TextColored(
+                ImVec4(0.30f, 0.60f, 1.0f, 1.0f),
+                "%s", status.c_str());
+
+            ImGui::SameLine();
+            ImGui::TextDisabled("Please wait...");
         }
         else
         {
-            output
-                << L"NO THREATS DETECTED\n"
-                << L"\nNo matching indicators were found.";
+            const ScanState state = GetScanState();
+
+            const ImVec4 statusColor =
+                !state.error.empty()
+                ? ImVec4(0.92f, 0.30f, 0.30f, 1.0f)
+                : state.detected
+                ? ImVec4(0.95f, 0.35f, 0.32f, 1.0f)
+                : ImVec4(0.35f, 0.78f, 0.52f, 1.0f);
+
+            ImGui::TextColored(statusColor, "%s", status.c_str());
         }
 
-        return output.str();
-    }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
 
-    void ScanCurrentFile()
-    {
-        if (!g_filePath || !g_result || !g_scanStatus)
-            return;
+        ImGui::Text("Scan results");
 
-        if (g_currentFile.empty())
+        ImGui::BeginChild(
+            "Results",
+            ImVec2(0.0f, 0.0f),
+            ImGuiChildFlags_Borders);
+
+        const ScanState state = GetScanState();
+
+        if (g_scanning.load())
         {
-            SetText(
-                g_scanStatus,
-                L"Please select a file first."
-            );
-
-            SetLabelColor(
-                g_scanStatus,
-                COLOR_YELLOW
-            );
-
-            return;
+            ImGui::TextWrapped(
+                "Analysis is running in the background thread. "
+                "The interface remains responsive.");
         }
-
-        SetText(
-            g_scanStatus,
-            L"Scanning file..."
-        );
-
-        SetLabelColor(
-            g_scanStatus,
-            COLOR_ACCENT
-        );
-
-        SetText(
-            g_result,
-            L"BladeAntivirus is analyzing the selected file..."
-        );
-
-        UpdateWindow(g_mainWindow);
-
-        std::string filePath = ToNarrow(g_currentFile);
-        std::string databasePath = ResolveDatabasePath();
-
-        Scanner scanner;
-
-        bool initialized = scanner.initialize(databasePath);
-
-        if (!initialized)
+        else if (!state.error.empty())
         {
-            SetText(
-                g_scanStatus,
-                L"Scanner initialization failed."
-            );
+            ImGui::TextColored(
+                ImVec4(0.95f, 0.34f, 0.34f, 1.0f),
+                "Scan error");
 
-            SetLabelColor(
-                g_scanStatus,
-                COLOR_RED
-            );
-
-            SetText(
-                g_result,
-                L"Could not initialize the hash scanner.\n\n"
-                L"Database path:\n" +
-                ToWide(databasePath)
-            );
-
-            return;
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", state.error.c_str());
         }
-
-        ScanResult scanResult =
-            scanner.scan(filePath);
-
-        SignsEngine signsEngine;
-
-        SignsResult signsResult =
-            signsEngine.analyze(filePath);
-
-        bool detected =
-            scanResult.hashMatch ||
-            signsResult.verdict == "MALICIOUS" ||
-            signsResult.verdict == "SUSPICIOUS";
-
-        SetText(
-            g_scanStatus,
-            detected
-            ? L"Threat detected"
-            : L"Scan completed"
-        );
-
-        SetLabelColor(
-            g_scanStatus,
-            detected
-            ? COLOR_RED
-            : COLOR_GREEN
-        );
-
-        SetText(
-            g_result,
-            BuildScanResult(
-                scanResult,
-                signsResult
-            )
-        );
-    }
-
-    void CheckUpdates()
-    {
-        if (!g_updateStatus)
-            return;
-
-        SetText(
-            g_updateStatus,
-            L"Checking for database updates..."
-        );
-
-        SetLabelColor(
-            g_updateStatus,
-            COLOR_ACCENT
-        );
-
-        UpdateWindow(g_mainWindow);
-
-        const std::string manifestUrl =
-            "https://YOUR-DOMAIN.example/updates/manifest.txt";
-
-        if (manifestUrl.find("YOUR-DOMAIN") != std::string::npos)
+        else if (!state.valid)
         {
-            SetText(
-                g_updateStatus,
-                L"Update server is not configured yet."
-            );
-
-            SetLabelColor(
-                g_updateStatus,
-                COLOR_YELLOW
-            );
-
-            return;
+            ImGui::TextDisabled(
+                "Select a file and start a scan to see the results here.");
         }
-
-        Updater updater;
-
-        std::string status;
-
-        bool success =
-            updater.updateDatabase(
-                manifestUrl,
-                ResolveDatabasePath(),
-                ResolveVersionPath(),
-                status
-            );
-
-        SetText(
-            g_updateStatus,
-            ToWide(status)
-        );
-
-        SetLabelColor(
-            g_updateStatus,
-            success
-            ? COLOR_GREEN
-            : COLOR_RED
-        );
-    }
-
-    void ShowDashboard()
-    {
-        DestroyContentChildren();
-
-        SetActiveNavigation(Page::Dashboard);
-
-        RECT rc{};
-        GetClientRect(g_content, &rc);
-
-        int width = rc.right;
-
-        CreateLabel(
-            g_content,
-            L"Dashboard",
-            42,
-            36,
-            width - 84,
-            48,
-            g_fontTitle
-        );
-
-        CreateLabel(
-            g_content,
-            L"Security overview and protection status",
-            44,
-            82,
-            width - 88,
-            28,
-            g_font,
-            COLOR_MUTED
-        );
-
-        HWND protectionCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                132,
-                width - 84,
-                175,
-                COLOR_PANEL
-            );
-
-        // small green indicator panel instead of a glyph
-        CreateBladePanel(
-            protectionCard,
-            30,
-            32,
-            50,
-            50,
-            COLOR_GREEN
-        );
-
-        CreateLabel(
-            protectionCard,
-            L"Protection Status",
-            90,
-            28,
-            500,
-            45,
-            g_fontBig,
-            COLOR_TEXT
-        );
-
-        CreateLabel(
-            protectionCard,
-            L"BladeAntivirus protection systems are ready.",
-            92,
-            78,
-            620,
-            30,
-            g_font,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            protectionCard,
-            L"SHA-256 - Static signs - PE analysis",
-            92,
-            110,
-            700,
-            25,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateBladeButton(
-            protectionCard,
-            ID_SCAN_NOW,
-            L"Scan Now",
-            width - 300,
-            61,
-            220,
-            55,
-            true
-        );
-
-        int cardGap = 18;
-        int cardsY = 335;
-        int cardsWidth = width - 84;
-        int cardWidth =
-            (cardsWidth - cardGap * 2) / 3;
-
-        HWND card1 =
-            CreateBladePanel(
-                g_content,
-                42,
-                cardsY,
-                cardWidth,
-                140,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            card1,
-            L"Threat Database",
-            22,
-            20,
-            cardWidth - 44,
-            24,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            card1,
-            L"ACTIVE",
-            22,
-            55,
-            cardWidth - 44,
-            40,
-            g_fontBig,
-            COLOR_GREEN
-        );
-
-        CreateLabel(
-            card1,
-            L"SHA-256 indicators",
-            22,
-            105,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        HWND card2 =
-            CreateBladePanel(
-                g_content,
-                42 + cardWidth + cardGap,
-                cardsY,
-                cardWidth,
-                140,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            card2,
-            L"Static Analysis",
-            22,
-            20,
-            cardWidth - 44,
-            24,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            card2,
-            L"READY",
-            22,
-            55,
-            cardWidth - 44,
-            40,
-            g_fontBig,
-            COLOR_GREEN
-        );
-
-        CreateLabel(
-            card2,
-            L"PE file inspection",
-            22,
-            105,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        HWND card3 =
-            CreateBladePanel(
-                g_content,
-                42 + (cardWidth + cardGap) * 2,
-                cardsY,
-                cardWidth,
-                140,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            card3,
-            L"Sign Engine",
-            22,
-            20,
-            cardWidth - 44,
-            24,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            card3,
-            L"READY",
-            22,
-            55,
-            cardWidth - 44,
-            40,
-            g_fontBig,
-            COLOR_GREEN
-        );
-
-        CreateLabel(
-            card3,
-            L"Static indicators",
-            22,
-            105,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateLabel(
-            g_content,
-            L"Quick Scan",
-            42,
-            505,
-            400,
-            30,
-            g_fontMedium
-        );
-
-        CreateLabel(
-            g_content,
-            L"Run a local scan to inspect a suspicious file.",
-            42,
-            540,
-            width - 84,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-    }
-
-    void ShowScanner()
-    {
-        DestroyContentChildren();
-
-        SetActiveNavigation(Page::Scanner);
-
-        RECT rc{};
-        GetClientRect(g_content, &rc);
-
-        int width = rc.right;
-
-        CreateLabel(
-            g_content,
-            L"Scanner",
-            42,
-            36,
-            width - 84,
-            48,
-            g_fontTitle
-        );
-        // no-op patch: ensure context consistency
-
-        CreateLabel(
-            g_content,
-            L"Analyze a file using BladeAntivirus detection engines",
-            44,
-            82,
-            width - 88,
-            28,
-            g_font,
-            COLOR_MUTED
-        );
-
-        HWND targetCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                132,
-                width - 84,
-                150,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            targetCard,
-            L"TARGET FILE",
-            24,
-            22,
-            250,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        g_filePath =
-            CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                L"EDIT",
-                g_currentFile.empty()
-                ? L"No file selected"
-                : g_currentFile.c_str(),
-                WS_CHILD |
-                WS_VISIBLE |
-                ES_AUTOHSCROLL |
-                ES_LEFT,
-                24,
-                60,
-                width - 350,
-                42,
-                targetCard,
-                nullptr,
-                g_instance,
-                nullptr
-            );
-
-        SendMessageW(
-            g_filePath,
-            WM_SETFONT,
-            reinterpret_cast<WPARAM>(g_font),
-            TRUE
-        );
-
-        CreateBladeButton(
-            targetCard,
-            ID_SELECT_FILE,
-            L"SELECT FILE",
-            width - 300,
-            60,
-            250,
-            42,
-            false
-        );
-        CreateBladeButton(
-            g_content,
-            ID_SCAN_FILE,
-            L"Scan file",
-            42,
-            310,
-            230,
-            55,
-            true
-        );
-
-        g_scanStatus =
-            CreateLabel(
-                g_content,
-                L"Ready to scan",
-                300,
-                323,
-                width - 342,
-                30,
-                g_fontMedium,
-                COLOR_MUTED
-            );
-
-        HWND resultCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                390,
-                width - 84,
-                245,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            resultCard,
-            L"Scan result",
-            24,
-            20,
-            300,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        g_result =
-            CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                L"EDIT",
-                L"Select a file and press SCAN FILE.",
-                WS_CHILD |
-                WS_VISIBLE |
-                WS_VSCROLL |
-                ES_MULTILINE |
-                ES_AUTOVSCROLL |
-                ES_READONLY |
-                ES_LEFT,
-                24,
-                58,
-                width - 132,
-                165,
-                resultCard,
-                nullptr,
-                g_instance,
-                nullptr
-            );
-
-        SendMessageW(
-            g_result,
-            WM_SETFONT,
-            reinterpret_cast<WPARAM>(g_fontMono),
-            TRUE
-        );
-    }
-
-    void ShowUpdates()
-    {
-        DestroyContentChildren();
-
-        SetActiveNavigation(Page::Updates);
-
-        RECT rc{};
-        GetClientRect(g_content, &rc);
-
-        int width = rc.right;
-
-        CreateLabel(
-            g_content,
-            L"Updates",
-            42,
-            36,
-            width - 84,
-            48,
-            g_fontTitle
-        );
-
-        CreateLabel(
-            g_content,
-            L"Keep the local threat database up to date",
-            44,
-            82,
-            width - 88,
-            28,
-            g_font,
-            COLOR_MUTED
-        );
-
-        HWND updateCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                132,
-                width - 84,
-                225,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            updateCard,
-            L"THREAT DATABASE",
-            28,
-            25,
-            300,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            updateCard,
-            L"SHA-256 DATABASE",
-            28,
-            65,
-            450,
-            40,
-            g_fontBig
-        );
-
-        CreateLabel(
-            updateCard,
-            L"Local indicator database",
-            28,
-            112,
-            450,
-            25,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateBladeButton(
-            updateCard,
-            ID_CHECK_UPDATE,
-            L"CHECK FOR UPDATES",
-            width - 340,
-            72,
-            285,
-            55,
-            true
-        );
-
-        g_updateStatus =
-            CreateLabel(
-                updateCard,
-                L"Ready to check for updates",
-                28,
-                165,
-                width - 80,
-                28,
-                g_fontSmall,
-                COLOR_MUTED
-            );
-
-        HWND infoCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                385,
-                width - 84,
-                155,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            infoCard,
-            L"UPDATE INFORMATION",
-            24,
-            22,
-            350,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            infoCard,
-            L"Database updates are downloaded through the configured updater.",
-            24,
-            60,
-            width - 130,
-            25,
-            g_font,
-            COLOR_TEXT
-        );
-
-        CreateLabel(
-            infoCard,
-            L"Manifest URL can be configured in the updater settings.",
-            24,
-            96,
-            width - 130,
-            25,
-            g_fontSmall,
-            COLOR_DIM
-        );
-    }
-
-    void ShowAbout()
-    {
-        DestroyContentChildren();
-
-        SetActiveNavigation(Page::About);
-
-        RECT rc{};
-        GetClientRect(g_content, &rc);
-
-        int width = rc.right;
-
-        CreateLabel(
-            g_content,
-            L"About BladeAntivirus",
-            42,
-            36,
-            width - 84,
-            48,
-            g_fontTitle
-        );
-
-        CreateLabel(
-            g_content,
-            L"Lightweight Windows malware analysis and detection engine",
-            44,
-            82,
-            width - 88,
-            28,
-            g_font,
-            COLOR_MUTED
-        );
-
-        HWND aboutCard =
-            CreateBladePanel(
-                g_content,
-                42,
-                132,
-                width - 84,
-                190,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            aboutCard,
-            L"BLADE",
-            28,
-            24,
-            400,
-            45,
-            g_fontHuge,
-            COLOR_ACCENT
-        );
-
-        CreateLabel(
-            aboutCard,
-            L"BladeAntivirus",
-            28,
-            76,
-            500,
-            42,
-            g_fontBig
-        );
-
-        CreateLabel(
-            aboutCard,
-            L"Native C++ security application for Windows",
-            28,
-            124,
-            650,
-            25,
-            g_font,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            aboutCard,
-            L"Version 1.0.0",
-            width - 250,
-            28,
-            180,
-            30,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        int gap = 18;
-        int cardWidth = (width - 84 - gap) / 2;
-
-        HWND engine1 =
-            CreateBladePanel(
-                g_content,
-                42,
-                345,
-                cardWidth,
-                130,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            engine1,
-            L"SHA-256 ENGINE",
-            22,
-            20,
-            cardWidth - 44,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            engine1,
-            L"Hash Detection",
-            22,
-            55,
-            cardWidth - 44,
-            32,
-            g_fontMedium
-        );
-
-        CreateLabel(
-            engine1,
-            L"Local indicator database",
-            22,
-            94,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        HWND engine2 =
-            CreateBladePanel(
-                g_content,
-                42 + cardWidth + gap,
-                345,
-                cardWidth,
-                130,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            engine2,
-            L"STATIC SIGNS",
-            22,
-            20,
-            cardWidth - 44,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            engine2,
-            L"Static Analysis",
-            22,
-            55,
-            cardWidth - 44,
-            32,
-            g_fontMedium
-        );
-
-        CreateLabel(
-            engine2,
-            L"Local file indicators",
-            22,
-            94,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        HWND engine3 =
-            CreateBladePanel(
-                g_content,
-                42,
-                493,
-                cardWidth,
-                130,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            engine3,
-            L"PE ANALYZER",
-            22,
-            20,
-            cardWidth - 44,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            engine3,
-            L"Portable Executable",
-            22,
-            55,
-            cardWidth - 44,
-            32,
-            g_fontMedium
-        );
-
-        CreateLabel(
-            engine3,
-            L"Windows PE inspection",
-            22,
-            94,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        HWND engine4 =
-            CreateBladePanel(
-                g_content,
-                42 + cardWidth + gap,
-                493,
-                cardWidth,
-                130,
-                COLOR_PANEL
-            );
-
-        CreateLabel(
-            engine4,
-            L"UPDATER",
-            22,
-            20,
-            cardWidth - 44,
-            25,
-            g_fontSmall,
-            COLOR_MUTED
-        );
-
-        CreateLabel(
-            engine4,
-            L"Database Updates",
-            22,
-            55,
-            cardWidth - 44,
-            32,
-            g_fontMedium
-        );
-
-        CreateLabel(
-            engine4,
-            L"WinHTTP update engine",
-            22,
-            94,
-            cardWidth - 44,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-    }
-
-    void CreateSidebar()
-    {
-        CreateLabel(
-            g_sidebar,
-            L"BLADE",
-            28,
-            28,
-            190,
-            48,
-            g_fontHuge,
-            COLOR_TEXT
-        );
-
-        CreateLabel(
-            g_sidebar,
-            L"ANTIVIRUS",
-            31,
-            76,
-            180,
-            22,
-            g_fontSmall,
-            COLOR_ACCENT
-        );
-
-        HWND line =
-            CreateWindowExW(
-                0,
-                L"STATIC",
-                L"",
-                WS_CHILD | WS_VISIBLE,
-                28,
-                116,
-                185,
-                1,
-                g_sidebar,
-                nullptr,
-                g_instance,
-                nullptr
-            );
-
-        SendMessageW(
-            line,
-            WM_SETFONT,
-            reinterpret_cast<WPARAM>(g_font),
-            TRUE
-        );
-
-        g_navDashboard =
-            CreateBladeButton(
-                g_sidebar,
-                ID_NAV_DASHBOARD,
-                L"Dashboard",
-                20,
-                145,
-                205,
-                46,
-                true
-            );
-
-        // Ensure nav button text is set and visible
-        if (g_navDashboard)
-            SetWindowTextW(g_navDashboard, L"Dashboard");
-
-        g_navScanner =
-            CreateBladeButton(
-                g_sidebar,
-                ID_NAV_SCANNER,
-                L"Scanner",
-                20,
-                198,
-                205,
-                46
-            );
-
-        if (g_navScanner)
-            SetWindowTextW(g_navScanner, L"Scanner");
-
-        g_navUpdates =
-            CreateBladeButton(
-                g_sidebar,
-                ID_NAV_UPDATES,
-                L"Updates",
-                20,
-                251,
-                205,
-                46
-            );
-
-        if (g_navUpdates)
-            SetWindowTextW(g_navUpdates, L"Updates");
-
-        g_navAbout =
-            CreateBladeButton(
-                g_sidebar,
-                ID_NAV_ABOUT,
-                L"About",
-                20,
-                304,
-                205,
-                46
-            );
-
-        if (g_navAbout)
-            SetWindowTextW(g_navAbout, L"About");
-
-        CreateLabel(
-            g_sidebar,
-            L"PROTECTION",
-            28,
-            530,
-            180,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateLabel(
-            g_sidebar,
-            L"Protection: Active",
-            28,
-            560,
-            180,
-            28,
-            g_fontMedium,
-            COLOR_GREEN
-        );
-
-        CreateLabel(
-            g_sidebar,
-            L"Local protection engine",
-            28,
-            592,
-            190,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateLabel(
-            g_sidebar,
-            L"BladeAntivirus",
-            28,
-            650,
-            190,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-
-        CreateLabel(
-            g_sidebar,
-            L"Windows Security Tool",
-            28,
-            676,
-            190,
-            22,
-            g_fontSmall,
-            COLOR_DIM
-        );
-    }
-
-    void LayoutMainWindow()
-    {
-        if (!g_mainWindow)
-            return;
-
-        RECT rc{};
-        GetClientRect(g_mainWindow, &rc);
-
-        int width = rc.right;
-        int height = rc.bottom;
-
-        int contentHeight =
-            height - FOOTER_HEIGHT;
-
-        if (g_sidebar)
+        else
         {
-            MoveWindow(
-                g_sidebar,
-                0,
-                0,
-                SIDEBAR_WIDTH,
-                contentHeight,
-                TRUE
-            );
-        }
-
-        if (g_content)
-        {
-            MoveWindow(
-                g_content,
-                SIDEBAR_WIDTH,
-                0,
-                width - SIDEBAR_WIDTH,
-                contentHeight,
-                TRUE
-            );
-        }
-
-        if (g_footer)
-        {
-            MoveWindow(
-                g_footer,
-                SIDEBAR_WIDTH,
-                contentHeight,
-                width - SIDEBAR_WIDTH,
-                FOOTER_HEIGHT,
-                TRUE
-            );
-        }
-
-        if (g_currentPage == Page::Scanner)
-        {
-            RECT contentRc{};
-            GetClientRect(g_content, &contentRc);
-
-            int contentWidth = contentRc.right;
-
-            if (g_filePath)
+            if (state.detected)
             {
-                MoveWindow(
-                    g_filePath,
-                    24,
-                    60,
-                    contentWidth - 350,
-                    42,
-                    TRUE
-                );
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.30f, 0.30f, 1.0f),
+                    "SUSPICIOUS INDICATORS FOUND");
+            }
+            else
+            {
+                ImGui::TextColored(
+                    ImVec4(0.35f, 0.80f, 0.53f, 1.0f),
+                    "NO MATCHING INDICATORS FOUND");
             }
 
-            if (g_result)
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            ImGui::Text("File:");
+            ImGui::TextWrapped(
+                "%s", WideToUtf8(g_selectedPath).c_str());
+
+            ImGui::Spacing();
+            ImGui::Text("SHA-256 engine");
+
+            ImGui::BulletText(
+                "Hash match: %s",
+                state.scan.hashMatch ? "YES" : "NO");
+
+            ImGui::BulletText(
+                "PE file: %s",
+                state.scan.isPE ? "YES" : "NO");
+
+            ImGui::BulletText(
+                "Engine verdict: %s",
+                state.scan.verdict.empty()
+                ? "Not provided"
+                : state.scan.verdict.c_str());
+
+            if (!state.scan.sha256.empty())
             {
-                HWND resultCard = GetParent(g_result);
+                ImGui::Text("SHA-256:");
+                ImGui::TextWrapped(
+                    "%s", state.scan.sha256.c_str());
+            }
 
-                RECT resultRc{};
-                GetClientRect(resultCard, &resultRc);
+            ImGui::Spacing();
+            ImGui::Separator();
 
-                MoveWindow(
-                    g_result,
-                    24,
-                    58,
-                    resultRc.right - 48,
-                    resultRc.bottom - 80,
-                    TRUE
-                );
+            ImGui::Text("Static signs");
+            ImGui::BulletText(
+                "Score: %d", state.signs.score);
+
+            ImGui::BulletText(
+                "Verdict: %s",
+                state.signs.verdict.empty()
+                ? "Not provided"
+                : state.signs.verdict.c_str());
+
+            if (state.signs.matches.empty())
+            {
+                ImGui::TextDisabled("No static signs matched.");
+            }
+            else
+            {
+                for (const auto& match : state.signs.matches)
+                {
+                    ImGui::Spacing();
+
+                    ImGui::Text(
+                        "%s (+%d)",
+                        match.name.c_str(),
+                        match.score);
+
+                    ImGui::TextWrapped(
+                        "%s", match.description.c_str());
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            ImGui::TextDisabled(
+                "A clean result does not guarantee that a file is safe. "
+                "Static heuristics can produce false positives and false negatives.");
+        }
+
+        ImGui::EndChild();
+    }
+
+    void DrawUpdates()
+    {
+        ImGui::TextDisabled("DATABASE MANAGEMENT");
+        ImGui::Spacing();
+        ImGui::Text("Updates");
+        ImGui::TextWrapped(
+            "BladeAntivirus updates local SHA-256, URL and IP databases "
+            "from public threat-intelligence feeds. Automatic updates "
+            "are checked when the application starts.");
+
+        ImGui::Spacing();
+
+        ImGui::BeginChild(
+            "UpdateCard",
+            ImVec2(0.0f, 185.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextDisabled("THREAT DATABASE");
+        ImGui::Spacing();
+        ImGui::Text("SHA-256 indicators");
+        ImGui::TextDisabled("Local database: database/hashes.txt");
+
+        ImGui::Spacing();
+
+        if (g_updating.load())
+        {
+            ImGui::BeginDisabled();
+            ImGui::Button("Updating...", ImVec2(220.0f, 44.0f));
+            ImGui::EndDisabled();
+        }
+        else
+        {
+            if (!UpdatesDue())
+            {
+                ImGui::BeginDisabled();
+                ImGui::Button("Check for updates", ImVec2(220.0f, 44.0f));
+                ImGui::EndDisabled();
+            }
+            else
+            {
+                if (ImGui::Button(
+                    "Check for updates", ImVec2(220.0f, 44.0f)))
+                {
+                    // Double-check before starting update to ensure the
+                    // button cannot trigger action when not due.
+                    if (UpdatesDue())
+                        StartUpdate(true);
+                }
             }
         }
 
-        InvalidateRect(g_mainWindow, nullptr, TRUE);
+        ImGui::Spacing();
+
+        const std::string status = GetUpdateStatus();
+
+        ImGui::TextWrapped("%s", status.c_str());
+
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+
+        // Configuration information removed; updater uses local feed files.
     }
 
-    LRESULT CALLBACK BladeButtonProc(
+    void DrawAbout()
+    {
+        ImGui::TextDisabled("APPLICATION INFORMATION");
+        ImGui::Spacing();
+        ImGui::Text("About BladeAntivirus");
+
+        ImGui::Spacing();
+
+        ImGui::BeginChild(
+            "AboutCard",
+            ImVec2(0.0f, 190.0f),
+            ImGuiChildFlags_Borders);
+
+        ImGui::TextColored(
+            ImVec4(0.24f, 0.53f, 1.0f, 1.0f),
+            "BLADE");
+
+        ImGui::SameLine();
+        ImGui::Text("ANTIVIRUS");
+
+        ImGui::Spacing();
+        ImGui::Text("Version 1.0.0");
+
+        ImGui::TextWrapped(
+            "Native Windows application for local file inspection.");
+
+        ImGui::Spacing();
+        ImGui::TextDisabled(
+            "Interface: Dear ImGui + DirectX 11");
+
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::Text("Components");
+
+        ImGui::BulletText("SHA-256 hash detection");
+        ImGui::BulletText("PE file inspection");
+        ImGui::BulletText("Static sign analysis");
+        ImGui::BulletText("WinHTTP database updater");
+
+        ImGui::Spacing();
+
+        ImGui::TextColored(
+            ImVec4(0.95f, 0.72f, 0.26f, 1.0f),
+            "Real-time file blocking is not implemented.");
+    }
+
+    void DrawInterface()
+    {
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+
+        constexpr ImGuiWindowFlags flags =
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoNavFocus;
+
+        ImGui::Begin("BladeAntivirusRoot", nullptr, flags);
+        ImGui::PopStyleVar(3);
+
+        DrawSidebar();
+
+        ImGui::SameLine(0.0f, 0.0f);
+
+        ImGui::BeginChild(
+            "MainContent",
+            ImVec2(0.0f, 0.0f),
+            ImGuiChildFlags_None);
+
+        ImGui::TextColored(
+            ImVec4(0.24f, 0.53f, 1.0f, 1.0f),
+            "BLADEANTIVIRUS");
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("/");
+
+        switch (g_page)
+        {
+        case Page::Dashboard:
+            DrawDashboard();
+            break;
+
+        case Page::Scanner:
+            DrawScanner();
+            break;
+
+        case Page::Updates:
+            DrawUpdates();
+            break;
+
+        case Page::About:
+            DrawAbout();
+            break;
+        }
+
+        ImGui::EndChild();
+        ImGui::End();
+    }
+
+    LRESULT WINAPI WindowProc(
         HWND hwnd,
         UINT message,
         WPARAM wParam,
-        LPARAM lParam
-    )
+        LPARAM lParam)
     {
-        ButtonState* state =
-            reinterpret_cast<ButtonState*>(
-                GetWindowLongPtrW(
-                    hwnd,
-                    GWLP_USERDATA
-                )
-                );
-
-        switch (message)
+        if (g_imguiInitialized)
         {
-        case WM_NCCREATE:
-        {
-            auto* newState = new ButtonState();
-
-            SetWindowLongPtrW(
-                hwnd,
-                GWLP_USERDATA,
-                reinterpret_cast<LONG_PTR>(newState)
-            );
-
-            return TRUE;
-        }
-
-        case WM_SETFONT:
-            if (state)
-            {
-                state->font =
-                    reinterpret_cast<HFONT>(wParam);
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE
-                );
-            }
-
-            return 0;
-
-        case WM_BLADE_ACTIVE:
-            if (state)
-            {
-                state->active =
-                    (wParam != 0);
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE
-                );
-            }
-
-            return 0;
-
-        case WM_MOUSEMOVE:
-            if (state)
-            {
-                if (!state->tracking)
-                {
-                    TRACKMOUSEEVENT tme{};
-                    tme.cbSize =
-                        sizeof(TRACKMOUSEEVENT);
-                    tme.dwFlags = TME_LEAVE;
-                    tme.hwndTrack = hwnd;
-
-                    TrackMouseEvent(&tme);
-
-                    state->tracking = true;
-                }
-
-                if (!state->hover)
-                {
-                    state->hover = true;
-
-                    InvalidateRect(
-                        hwnd,
-                        nullptr,
-                        TRUE
-                    );
-                }
-            }
-
-            break;
-
-        case WM_MOUSELEAVE:
-            if (state)
-            {
-                state->hover = false;
-                state->tracking = false;
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE
-                );
-            }
-
-            break;
-
-        case WM_LBUTTONDOWN:
-            if (state)
-            {
-                state->pressed = true;
-
-                SetCapture(hwnd);
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE
-                );
-            }
-
-            return 0;
-
-        case WM_LBUTTONUP:
-            if (state)
-            {
-                bool wasPressed =
-                    state->pressed;
-
-                state->pressed = false;
-
-                if (GetCapture() == hwnd)
-                    ReleaseCapture();
-
-                RECT rc{};
-                GetClientRect(hwnd, &rc);
-
-                POINT pt{};
-                pt.x = GET_X_LPARAM(lParam);
-                pt.y = GET_Y_LPARAM(lParam);
-
-                bool inside =
-                    PtInRect(&rc, pt) != FALSE;
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE
-                );
-
-                if (wasPressed && inside)
-                {
-                {
-                    HWND target = GetAncestor(hwnd, GA_ROOT);
-                    if (!target)
-                        target = GetParent(hwnd);
-
-                    SendMessageW(
-                        target,
-                        WM_COMMAND,
-                        MAKEWPARAM(
-                            GetDlgCtrlID(hwnd),
-                            BN_CLICKED
-                        ),
-                        reinterpret_cast<LPARAM>(hwnd)
-                    );
-                }
-                    // Briefly show pressed animation
-                    state->pressed = true;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                    SetTimer(hwnd, 1, 120, nullptr);
-                }
-            }
-
-            return 0;
-
-        case WM_KEYDOWN:
-            if (wParam == VK_SPACE ||
-                wParam == VK_RETURN)
-            {
-                if (state)
-                {
-                    state->pressed = true;
-
-                    InvalidateRect(
-                        hwnd,
-                        nullptr,
-                        TRUE
-                    );
-                }
-
-                return 0;
-            }
-
-            break;
-
-        case WM_KEYUP:
-            if (wParam == VK_SPACE ||
-                wParam == VK_RETURN)
-            {
-                if (state)
-                {
-                    // show pressed briefly when activated by keyboard
-                    state->pressed = true;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                    SetTimer(hwnd, 1, 120, nullptr);
-                }
-
-                {
-                    HWND target = GetAncestor(hwnd, GA_ROOT);
-                    if (!target)
-                        target = GetParent(hwnd);
-
-                    SendMessageW(
-                        target,
-                        WM_COMMAND,
-                        MAKEWPARAM(
-                            GetDlgCtrlID(hwnd),
-                            BN_CLICKED
-                        ),
-                        reinterpret_cast<LPARAM>(hwnd)
-                    );
-                }
-
-                return 0;
-            }
-
-            break;
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-
-            HDC hdc =
-                BeginPaint(
-                    hwnd,
-                    &ps
-                );
-
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-
-            COLORREF background =
-                COLOR_BUTTON;
-
-            if (state && state->active)
-                background = RGB(36, 43, 55);
-            else if (state && state->hover)
-                background = COLOR_BUTTON_HOV;
-
-            if (state && state->pressed)
-                background = RGB(44, 48, 58);
-
-            HBRUSH brush =
-                CreateSolidBrush(background);
-
-            HRGN region =
-                CreateRoundRectRgn(
-                    0,
-                    0,
-                    rc.right,
-                    rc.bottom,
-                    10,
-                    10
-                );
-
-            FillRgn(
-                hdc,
-                region,
-                brush
-            );
-
-            DeleteObject(region);
-            DeleteObject(brush);
-
-            if (state && state->active)
-            {
-                HBRUSH accentBrush =
-                    CreateSolidBrush(
-                        COLOR_ACCENT
-                    );
-
-                RECT accent{};
-                accent.left = 0;
-                accent.top = 8;
-                accent.right = 3;
-                accent.bottom = rc.bottom - 8;
-
-                FillRect(
-                    hdc,
-                    &accent,
-                    accentBrush
-                );
-
-                DeleteObject(
-                    accentBrush
-                );
-            }
-
-            SetBkMode(
-                hdc,
-                TRANSPARENT
-            );
-
-            SetTextColor(
-                hdc,
-                COLOR_TEXT
-            );
-
-            HFONT oldFont = nullptr;
-
-            if (state && state->font)
-            {
-                oldFont =
-                    static_cast<HFONT>(
-                        SelectObject(
-                            hdc,
-                            state->font
-                        )
-                        );
-            }
-            else if (g_fontMedium)
-            {
-                oldFont =
-                    static_cast<HFONT>(
-                        SelectObject(
-                            hdc,
-                            g_fontMedium
-                        )
-                    );
-            }
-
-            wchar_t text[512]{};
-
-            GetWindowTextW(
-                hwnd,
-                text,
-                512
-            );
-
-            RECT textRect = rc;
-            textRect.left += 14; // padding
-            textRect.right -= 14;
-
-            DrawTextW(
-                hdc,
-                text,
-                -1,
-                &textRect,
-                DT_LEFT |
-                DT_VCENTER |
-                DT_SINGLELINE
-            );
-
-            if (oldFont)
-                SelectObject(
-                    hdc,
-                    oldFont
-                );
-            EndPaint(
-                hwnd,
-                &ps
-            );
-
-            return 0;
-
-            EndPaint(
-                hwnd,
-                &ps
-            );
-
-            return 0;
-        }
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_NCDESTROY:
-            delete state;
-
-            SetWindowLongPtrW(
-                hwnd,
-                GWLP_USERDATA,
-                0
-            );
-
-            break;
-
-        case WM_TIMER:
-            if (wParam == 1 && state)
-            {
-                KillTimer(hwnd, 1);
-                state->pressed = false;
-                InvalidateRect(hwnd, nullptr, TRUE);
-            }
-
-            return 0;
-        }
-
-        return DefWindowProcW(
-            hwnd,
-            message,
-            wParam,
-            lParam
-        );
-    }
-
-    LRESULT CALLBACK BladePanelProc(
-        HWND hwnd,
-        UINT message,
-        WPARAM wParam,
-        LPARAM lParam
-    )
-    {
-        COLORREF background =
-            COLOR_PANEL;
-
-        if (GetWindowLongPtrW(
-            hwnd,
-            GWLP_USERDATA) != 0)
-        {
-            background =
-                static_cast<COLORREF>(
-                    GetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA
-                    )
-                    );
+            const LRESULT imguiResult =
+                ImGui_ImplWin32_WndProcHandler(
+                    hwnd, message, wParam, lParam);
+
+            if (imguiResult)
+                return imguiResult;
         }
 
         switch (message)
         {
-        case WM_NCCREATE:
-        {
-            auto* create =
-                reinterpret_cast<
-                CREATESTRUCTW*
-                >(lParam);
-
-            COLORREF color =
-                COLOR_PANEL;
-
-            if (create &&
-                create->lpCreateParams)
-            {
-                color =
-                    *reinterpret_cast<
-                    COLORREF*
-                    >(create->lpCreateParams);
-            }
-
-            SetWindowLongPtrW(
-                hwnd,
-                GWLP_USERDATA,
-                static_cast<LONG_PTR>(color)
-            );
-
-            return TRUE;
-        }
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-
-            HDC hdc =
-                BeginPaint(
-                    hwnd,
-                    &ps
-                );
-
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-
-            COLORREF bg =
-                static_cast<COLORREF>(
-                    GetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA
-                    )
-                    );
-
-            HBRUSH brush =
-                CreateSolidBrush(bg);
-
-            FillRect(
-                hdc,
-                &rc,
-                brush
-            );
-
-            DeleteObject(brush);
-
-            EndPaint(
-                hwnd,
-                &ps
-            );
-
-            return 0;
-        }
-
-        case WM_CTLCOLORSTATIC:
-        {
-            HDC hdc =
-                reinterpret_cast<HDC>(wParam);
-
-            HWND control =
-                reinterpret_cast<HWND>(lParam);
-
-            COLORREF textColor =
-                COLOR_TEXT;
-
-            HANDLE property =
-                GetPropW(
-                    control,
-                    L"BladeTextColor"
-                );
-
-            if (property)
-            {
-                textColor =
-                    static_cast<COLORREF>(
-                        reinterpret_cast<
-                        ULONG_PTR
-                        >(property)
-                        );
-            }
-
-            SetTextColor(
-                hdc,
-                textColor
-            );
-
-            SetBkMode(
-                hdc,
-                TRANSPARENT
-            );
-
-            COLORREF bg =
-                static_cast<COLORREF>(
-                    GetWindowLongPtrW(
-                        hwnd,
-                        GWLP_USERDATA
-                    )
-                    );
-
-            if (bg == 0)
-                bg = COLOR_PANEL;
-
-            if (bg == COLOR_SIDEBAR)
-                return reinterpret_cast<LRESULT>(
-                    g_sidebarBrush
-                    );
-
-            if (bg == COLOR_PANEL_ALT)
-                return reinterpret_cast<LRESULT>(
-                    g_panelAltBrush
-                    );
-
-            return reinterpret_cast<LRESULT>(
-                g_panelBrush
-                );
-        }
-
-        case WM_CTLCOLOREDIT:
-        {
-            HDC hdc =
-                reinterpret_cast<HDC>(wParam);
-
-            SetTextColor(
-                hdc,
-                COLOR_TEXT
-            );
-
-            SetBkColor(
-                hdc,
-                COLOR_PANEL_ALT
-            );
-
-            return reinterpret_cast<LRESULT>(
-                g_editBrush
-                );
-        }
-        }
-
-        return DefWindowProcW(
-            hwnd,
-            message,
-            wParam,
-            lParam
-        );
-    }
-
-    LRESULT CALLBACK MainWindowProc(
-        HWND hwnd,
-        UINT message,
-        WPARAM wParam,
-        LPARAM lParam
-    )
-    {
-        switch (message)
-        {
-        case WM_CREATE:
-        {
-            g_mainWindow = hwnd;
-
-            g_font =
-                CreateBladeFont(
-                    17,
-                    FW_NORMAL
-                );
-
-            g_fontSmall =
-                CreateBladeFont(
-                    14,
-                    FW_NORMAL
-                );
-
-            g_fontMedium =
-                CreateBladeFont(
-                    16,
-                    FW_SEMIBOLD
-                );
-
-            g_fontBold =
-                CreateBladeFont(
-                    18,
-                    FW_BOLD
-                );
-
-            g_fontTitle =
-                CreateBladeFont(
-                    30,
-                    FW_SEMIBOLD
-                );
-
-            g_fontBig =
-                CreateBladeFont(
-                    25,
-                    FW_SEMIBOLD
-                );
-
-            g_fontHuge =
-                CreateBladeFont(
-                    31,
-                    FW_BOLD
-                );
-
-            g_fontMono =
-                CreateBladeFont(
-                    14,
-                    FW_NORMAL,
-                    L"Consolas"
-                );
-
-            g_backgroundBrush =
-                CreateSolidBrush(
-                    COLOR_BACKGROUND
-                );
-
-            g_sidebarBrush =
-                CreateSolidBrush(
-                    COLOR_SIDEBAR
-                );
-
-            g_panelBrush =
-                CreateSolidBrush(
-                    COLOR_PANEL
-                );
-
-            g_panelAltBrush =
-                CreateSolidBrush(
-                    COLOR_PANEL_ALT
-                );
-
-            g_editBrush =
-                CreateSolidBrush(
-                    COLOR_PANEL_ALT
-                );
-
-            g_sidebar =
-                CreateBladePanel(
-                    hwnd,
-                    0,
-                    0,
-                    SIDEBAR_WIDTH,
-                    600,
-                    COLOR_SIDEBAR
-                );
-
-            g_content =
-                CreateBladePanel(
-                    hwnd,
-                    SIDEBAR_WIDTH,
-                    0,
-                    800,
-                    600,
-                    COLOR_BACKGROUND
-                );
-
-            g_footer =
-                CreateBladePanel(
-                    hwnd,
-                    SIDEBAR_WIDTH,
-                    600,
-                    800,
-                    FOOTER_HEIGHT,
-                    COLOR_SIDEBAR
-                );
-
-            CreateSidebar();
-
-            CreateLabel(
-                g_footer,
-                L"BladeAntivirus - Local protection engine",
-                20,
-                7,
-                500,
-                22,
-                g_fontSmall,
-                COLOR_DIM
-            );
-
-            CreateLabel(
-                g_footer,
-                L"PROTECTION ACTIVE",
-                650,
-                7,
-                180,
-                22,
-                g_fontSmall,
-                COLOR_GREEN
-            );
-
-            ShowDashboard();
-
-            LayoutMainWindow();
-
-            return 0;
-        }
-
         case WM_SIZE:
-            LayoutMainWindow();
-            return 0;
-
-        case WM_COMMAND:
-        {
-            int id =
-                LOWORD(wParam);
-
-            switch (id)
+            if (g_device &&
+                wParam != SIZE_MINIMIZED &&
+                g_swapChain)
             {
-            case ID_NAV_DASHBOARD:
-                Navigate(Page::Dashboard);
-                return 0;
+                CleanupRenderTarget();
 
-            case ID_NAV_SCANNER:
-                Navigate(Page::Scanner);
-                return 0;
+                const HRESULT result = g_swapChain->ResizeBuffers(
+                    0,
+                    LOWORD(lParam),
+                    HIWORD(lParam),
+                    DXGI_FORMAT_UNKNOWN,
+                    0);
 
-            case ID_NAV_UPDATES:
-                Navigate(Page::Updates);
-                return 0;
-
-            case ID_NAV_ABOUT:
-                Navigate(Page::About);
-                return 0;
-
-            case ID_SCAN_NOW:
-                Navigate(Page::Scanner);
-                SelectFile();
-                return 0;
-
-            case ID_SELECT_FILE:
-                SelectFile();
-                return 0;
-
-            case ID_SCAN_FILE:
-                ScanCurrentFile();
-                return 0;
-
-            case ID_CHECK_UPDATE:
-                CheckUpdates();
-                return 0;
+                if (SUCCEEDED(result))
+                    CreateRenderTarget();
             }
-
-            break;
-        }
-
-        case WM_CTLCOLORSTATIC:
-        {
-            HDC hdc =
-                reinterpret_cast<HDC>(wParam);
-
-            SetTextColor(
-                hdc,
-                COLOR_TEXT
-            );
-
-            SetBkMode(
-                hdc,
-                TRANSPARENT
-            );
-
-            return reinterpret_cast<LRESULT>(
-                g_backgroundBrush
-                );
-        }
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-
-            HDC hdc =
-                BeginPaint(
-                    hwnd,
-                    &ps
-                );
-
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-
-            FillRect(
-                hdc,
-                &rc,
-                g_backgroundBrush
-            );
-
-            EndPaint(
-                hwnd,
-                &ps
-            );
-
             return 0;
-        }
+
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) == SC_KEYMENU)
+                return 0;
+            break;
 
         case WM_DESTROY:
-        {
-            if (g_backgroundBrush)
-                DeleteObject(g_backgroundBrush);
-
-            if (g_sidebarBrush)
-                DeleteObject(g_sidebarBrush);
-
-            if (g_panelBrush)
-                DeleteObject(g_panelBrush);
-
-            if (g_panelAltBrush)
-                DeleteObject(g_panelAltBrush);
-
-            if (g_editBrush)
-                DeleteObject(g_editBrush);
-
-            if (g_font)
-                DeleteObject(g_font);
-
-            if (g_fontSmall)
-                DeleteObject(g_fontSmall);
-
-            if (g_fontMedium)
-                DeleteObject(g_fontMedium);
-
-            if (g_fontBold)
-                DeleteObject(g_fontBold);
-
-            if (g_fontTitle)
-                DeleteObject(g_fontTitle);
-
-            if (g_fontBig)
-                DeleteObject(g_fontBig);
-
-            if (g_fontHuge)
-                DeleteObject(g_fontHuge);
-
-            if (g_fontMono)
-                DeleteObject(g_fontMono);
-
             PostQuitMessage(0);
-
             return 0;
         }
-        }
 
-        return DefWindowProcW(
-            hwnd,
-            message,
-            wParam,
-            lParam
-        );
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
 
 int WINAPI wWinMain(
-    HINSTANCE hInstance,
+    HINSTANCE instance,
     HINSTANCE,
     PWSTR,
-    int nCmdShow
-)
+    int showCommand)
 {
-    g_instance = hInstance;
+    g_databasePath = GetDatabasePath();
+    g_urlPath = GetUrlDatabasePath();
+    g_ipPath = GetIpDatabasePath();
+    g_updateStatePath = GetUpdateStatePath();
 
-    WNDCLASSW buttonClass{};
-    buttonClass.lpfnWndProc = BladeButtonProc;
-    buttonClass.hInstance = hInstance;
-    buttonClass.hCursor =
-        LoadCursorW(
-            nullptr,
-            MAKEINTRESOURCEW(32512)
-        );
-    buttonClass.lpszClassName =
-        BUTTON_CLASS;
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_CLASSDC;
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = WINDOW_CLASS;
 
-    RegisterClassW(&buttonClass);
-
-    WNDCLASSW panelClass{};
-    panelClass.lpfnWndProc = BladePanelProc;
-    panelClass.hInstance = hInstance;
-    panelClass.hCursor =
-        LoadCursorW(
-            nullptr,
-            MAKEINTRESOURCEW(32512)
-        );
-    panelClass.lpszClassName =
-        PANEL_CLASS;
-
-    RegisterClassW(&panelClass);
-
-    WNDCLASSW windowClass{};
-    windowClass.lpfnWndProc =
-        MainWindowProc;
-
-    windowClass.hInstance =
-        hInstance;
-
-    windowClass.hCursor =
-        LoadCursorW(
-            nullptr,
-            MAKEINTRESOURCEW(32512)
-        );
-
-    windowClass.hbrBackground =
-        nullptr;
-
-    windowClass.lpszClassName =
-        WINDOW_CLASS;
-
-    if (!RegisterClassW(&windowClass))
+    if (!RegisterClassExW(&wc))
     {
         MessageBoxW(
             nullptr,
-            L"Failed to register BladeAntivirus window class.",
+            L"Could not register the application window.",
             L"BladeAntivirus",
-            MB_ICONERROR
-        );
+            MB_ICONERROR);
 
         return 1;
     }
 
-    HWND hwnd =
-        CreateWindowExW(
-            0,
-            WINDOW_CLASS,
-            L"BladeAntivirus",
-            WS_OVERLAPPEDWINDOW |
-            WS_CLIPCHILDREN |
-            WS_CLIPSIBLINGS,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1180,
-            760,
-            nullptr,
-            nullptr,
-            hInstance,
-            nullptr
-        );
+    g_window = CreateWindowExW(
+        0,
+        WINDOW_CLASS,
+        L"BladeAntivirus",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        1360,
+        850,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
 
-    if (!hwnd)
+    if (!g_window)
     {
+        UnregisterClassW(WINDOW_CLASS, instance);
+
         MessageBoxW(
             nullptr,
-            L"Failed to create BladeAntivirus window.",
+            L"Could not create the application window.",
             L"BladeAntivirus",
-            MB_ICONERROR
-        );
+            MB_ICONERROR);
 
         return 1;
     }
 
-    ShowWindow(
-        hwnd,
-        nCmdShow
-    );
+    if (!CreateDeviceD3D(g_window))
+    {
+        CleanupDeviceD3D();
+        DestroyWindow(g_window);
+        UnregisterClassW(WINDOW_CLASS, instance);
 
-    UpdateWindow(hwnd);
+        MessageBoxW(
+            nullptr,
+            L"Could not initialize DirectX 11.",
+            L"BladeAntivirus",
+            MB_ICONERROR);
+
+        return 1;
+    }
+
+    ShowWindow(g_window, showCommand);
+    UpdateWindow(g_window);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ApplyStyle();
+
+    if (!ImGui_ImplWin32_Init(g_window) ||
+        !ImGui_ImplDX11_Init(g_device, g_context))
+    {
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+
+        CleanupDeviceD3D();
+        DestroyWindow(g_window);
+        UnregisterClassW(WINDOW_CLASS, instance);
+
+        MessageBoxW(
+            nullptr,
+            L"Could not initialize the ImGui backends.",
+            L"BladeAntivirus",
+            MB_ICONERROR);
+
+        return 1;
+    }
+
+    g_imguiInitialized = true;
+
+    StartUpdate(false);
 
     MSG message{};
 
-    while (GetMessageW(
-        &message,
-        nullptr,
-        0,
-        0
-    ) > 0)
+    while (message.message != WM_QUIT)
     {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            continue;
+        }
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        DrawInterface();
+
+        ImGui::Render();
+
+        const float clearColor[4] =
+        {
+            0.043f,
+            0.047f,
+            0.059f,
+            1.0f
+        };
+
+        g_context->OMSetRenderTargets(1, &g_renderTarget, nullptr);
+        g_context->ClearRenderTargetView(
+            g_renderTarget, clearColor);
+
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        g_swapChain->Present(1, 0);
     }
 
-    return static_cast<int>(
-        message.wParam
-        );
+    g_imguiInitialized = false;
+
+    if (g_scanThread.joinable())
+        g_scanThread.join();
+
+    if (g_updateThread.joinable())
+        g_updateThread.join();
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupDeviceD3D();
+
+    DestroyWindow(g_window);
+    UnregisterClassW(WINDOW_CLASS, instance);
+
+    return static_cast<int>(message.wParam);
 }
