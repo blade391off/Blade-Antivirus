@@ -1,3 +1,6 @@
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/0079363f-2145-477e-88e4-18489ee06b85" />
+
+
 #  BladeAntivirus
 
 **An open-source Windows malware detection project built with C++ and Qt.**
