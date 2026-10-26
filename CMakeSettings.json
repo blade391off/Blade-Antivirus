@@ -1,0 +1,43 @@
+﻿{
+  "configurations": [
+    {
+      "name": "x64-Debug",
+      "generator": "Ninja",
+      "configurationType": "Debug",
+      "inheritEnvironments": [ "msvc_x64_x64" ],
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "cmakeCommandArgs": "",
+      "buildCommandArgs": "",
+      "ctestCommandArgs": ""
+    },
+    {
+      "name": "x86-Release",
+      "generator": "Ninja",
+      "configurationType": "RelWithDebInfo",
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "cmakeCommandArgs": "",
+      "buildCommandArgs": "",
+      "ctestCommandArgs": "",
+      "inheritEnvironments": [ "msvc_x86" ],
+      "variables": []
+    }
+    ,
+    {
+      "name": "MinGW-x64-Debug",
+      "generator": "MinGW Makefiles",
+      "configurationType": "Debug",
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "cmakeCommandArgs": "-DCMAKE_PREFIX_PATH=D:/Qt/6.12.0/mingw_64/lib/cmake -DCMAKE_MAKE_PROGRAM=C:/msys64/mingw64/bin/mingw32-make.exe",
+      "variables": [
+        { "name": "CMAKE_C_COMPILER", "value": "C:/msys64/mingw64/bin/gcc.exe" },
+        { "name": "CMAKE_CXX_COMPILER", "value": "C:/msys64/mingw64/bin/g++.exe" },
+        { "name": "CMAKE_BUILD_TYPE", "value": "Debug" }
+      ],
+      "environment": {
+        "PATH": "C:/msys64/mingw64/bin;D:/Qt/6.12.0/mingw_64/bin;${env.PATH}"
+      }
+    }
+  ]
+}
