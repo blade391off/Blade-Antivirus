@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 
 #include "updater.h"
 
@@ -26,7 +30,8 @@ namespace
         "https://raw.githubusercontent.com/romainmarcoux/malicious-hash/"
         "main/full-hash-sha256-{part}.txt";
 
-    constexpr long long UPDATE_INTERVAL_SECONDS = 6 * 60 * 60;
+    // The source refreshes hourly; never poll it more often than that.
+    constexpr long long UPDATE_INTERVAL_SECONDS = 60 * 60;
     constexpr std::size_t MAX_RESPONSE_SIZE = 32u * 1024u * 1024u;
     constexpr std::size_t MAX_HASH_ENTRIES = 1000000; // ~32 MB in RAM
     constexpr int MAX_PARTS = 16;
@@ -607,7 +612,7 @@ bool Updater::updateHashes(
         && now >= state.checked
         && now - state.checked < UPDATE_INTERVAL_SECONDS)
     {
-        status = "[SKIP] Next check in less than 6 hours.\nHash database is up to date.";
+        status = "[SKIP] Next check in less than 1 hour.\nHash database is up to date.";
         return true;
     }
 
@@ -709,8 +714,7 @@ bool Updater::updateHashes(
         return true;
     }
 
-    // Pass 2: the database is rebuilt from ALL files, so files that answered
-    // 304 are downloaded again (unconditionally).
+    
     for (Part& part : parts)
     {
         if (part.downloaded)

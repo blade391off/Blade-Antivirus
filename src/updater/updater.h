@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../updater/updater.h"
+
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -8,7 +10,7 @@
 class Updater
 {
 public:
-    // Default: romainmarcoux/malicious-hash (MIT), updated hourly.
+    
     static std::vector<std::string> defaultSources();
 
    

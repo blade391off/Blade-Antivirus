@@ -1,15 +1,16 @@
+
 #include "scan_controller.h"
 #include "scanner.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
-#include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QStringList>
 
-#include <string>
+#include <filesystem>
+#include <utility>
 
 ScanController::ScanController(QObject* parent)
     : QObject(parent)
@@ -24,10 +25,7 @@ ScanController::~ScanController()
         worker_.join();
 }
 
-bool ScanController::startScan(
-    const QString& targetPath,
-    bool recursive
-)
+bool ScanController::startScan(const QString& targetPath, bool recursive)
 {
     if (running_.load())
         return false;
@@ -37,7 +35,7 @@ bool ScanController::startScan(
 
     const QFileInfo target(targetPath);
 
-    if (targetPath.isEmpty() || !target.exists())
+    if (targetPath.trimmed().isEmpty() || !target.exists())
     {
         emit statusChanged(QStringLiteral("Invalid scan path"));
         return false;
@@ -51,8 +49,7 @@ bool ScanController::startScan(
         [this, targetPath, recursive]()
         {
             runScan(targetPath, recursive);
-        }
-    );
+        });
 
     return true;
 }
@@ -91,8 +88,7 @@ void ScanController::waitIfPaused()
         [this]()
         {
             return !paused_.load() || cancelled_.load();
-        }
-    );
+        });
 }
 
 void ScanController::publishStatus(const QString& status)
@@ -103,14 +99,10 @@ void ScanController::publishStatus(const QString& status)
         {
             emit statusChanged(status);
         },
-        Qt::QueuedConnection
-    );
+        Qt::QueuedConnection);
 }
 
-void ScanController::runScan(
-    QString targetPath,
-    bool recursive
-)
+void ScanController::runScan(QString targetPath, bool recursive)
 {
     int checkedFiles = 0;
     int threatsFound = 0;
@@ -122,49 +114,64 @@ void ScanController::runScan(
 
             running_.store(false);
 
-            const QString status =
-                wasCancelled
+            const QString status = wasCancelled
                 ? QStringLiteral("Scan cancelled")
                 : QStringLiteral("Scan completed");
 
             QMetaObject::invokeMethod(
                 this,
-                [this, checkedFiles, threatsFound,
-                wasCancelled, status]()
+                [this, checkedFiles, threatsFound, wasCancelled, status]()
                 {
                     emit statusChanged(status);
-
                     emit scanFinished(
                         checkedFiles,
                         threatsFound,
-                        wasCancelled
-                    );
+                        wasCancelled);
                 },
-                Qt::QueuedConnection
-            );
+                Qt::QueuedConnection);
         };
 
-    QString databasePath =
-        QDir(QCoreApplication::applicationDirPath())
+    QString databasePath = QDir(
+        QCoreApplication::applicationDirPath())
         .filePath(QStringLiteral("database/hashes.txt"));
 
-    if (!QFileInfo::exists(databasePath))
+    if (!QFileInfo(databasePath).isFile())
     {
-        databasePath =
-            QDir::current().filePath(
-                QStringLiteral("database/hashes.txt")
-            );
+        const QString currentPath = QDir::current()
+            .filePath(QStringLiteral("database/hashes.txt"));
+
+        if (QFileInfo(currentPath).isFile())
+            databasePath = currentPath;
+        else
+        {
+            running_.store(false);
+            publishStatus(
+                QStringLiteral("Hash database not found: database/hashes.txt"));
+
+            QMetaObject::invokeMethod(
+                this,
+                [this]()
+                {
+                    emit scanFinished(0, 0, false);
+                },
+                Qt::QueuedConnection);
+
+            return;
+        }
     }
+
+    publishStatus(QStringLiteral("Preparing scanner"));
 
     Scanner scanner;
 
-    if (!scanner.initialize(
-        QFile::encodeName(databasePath).toStdString()))
+    const std::filesystem::path databaseFsPath(
+        databasePath.toStdWString());
+
+    if (!scanner.initialize(databaseFsPath))
     {
         running_.store(false);
         publishStatus(
-            QStringLiteral("Failed to load hash database")
-        );
+            QStringLiteral("Failed to initialize scanner or load hash database"));
 
         QMetaObject::invokeMethod(
             this,
@@ -172,11 +179,20 @@ void ScanController::runScan(
             {
                 emit scanFinished(0, 0, false);
             },
-            Qt::QueuedConnection
-        );
+            Qt::QueuedConnection);
 
         return;
     }
+
+    if (cancelled_.load())
+    {
+        finish();
+        return;
+    }
+
+    publishStatus(
+        QStringLiteral("Scanner ready — database entries: %1")
+        .arg(static_cast<qulonglong>(scanner.databaseSize())));
 
     QStringList files;
     const QFileInfo target(targetPath);
@@ -187,16 +203,14 @@ void ScanController::runScan(
     }
     else if (target.isDir())
     {
-        const auto flags =
-            recursive
+        const auto flags = recursive
             ? QDirIterator::Subdirectories
             : QDirIterator::NoIteratorFlags;
 
         QDirIterator iterator(
             target.absoluteFilePath(),
             QDir::Files | QDir::NoDotAndDotDot,
-            flags
-        );
+            flags);
 
         while (iterator.hasNext())
         {
@@ -236,18 +250,15 @@ void ScanController::runScan(
 
         const QString fullName = QFileInfo(filePath).fileName();
 
-        const QString displayName =
-            fullName.size() > 8
-            ? fullName.left(7) + QChar(0x2026)
+        const QString displayName = fullName.size() > 32
+            ? fullName.left(29) + QChar(0x2026)
             : fullName;
 
-        const std::string encodedPath =
-            QFile::encodeName(filePath).toStdString();
+        const std::filesystem::path fileFsPath(
+            filePath.toStdWString());
 
-        const ScanResult result = scanner.scan(encodedPath);
-
-        const QString verdict =
-            QString::fromStdString(result.verdict);
+        const ScanResult result = scanner.scan(fileFsPath);
+        const QString verdict = QString::fromStdString(result.verdict);
 
         QString details;
 
@@ -255,52 +266,51 @@ void ScanController::runScan(
         {
             ++threatsFound;
 
-            details =
-                QStringLiteral("SHA-256 match: ") +
-                QString::fromStdString(result.sha256);
+            details = QStringLiteral("SHA-256 match: ")
+                + QString::fromStdString(result.sha256);
         }
         else if (verdict == QStringLiteral("CLEAN"))
         {
             details = result.isPE
                 ? QStringLiteral(
-                    "PE file checked; no hash signature match"
-                )
+                    "PE file checked; no hash signature match")
                 : QStringLiteral(
-                    "No hash signature match"
-                );
+                    "No hash signature match");
+        }
+        else if (verdict == QStringLiteral("SKIPPED"))
+        {
+            details = QStringLiteral(
+                "Skipped: cloud-only, unsupported file type, or file exceeds size limit");
         }
         else
         {
-            details = QStringLiteral(
-                "File could not be checked successfully"
-            );
+            details = QStringLiteral("File check failed");
+
+            if (result.winError != 0)
+            {
+                details += QStringLiteral(" (Windows error %1)")
+                    .arg(result.winError);
+            }
         }
 
         ++checkedFiles;
 
-        const int percentage =
-            checkedFiles * 100 / totalFiles;
+        const int percentage = checkedFiles * 100 / totalFiles;
 
         QMetaObject::invokeMethod(
             this,
             [this, displayName, verdict, details,
             checkedFiles, totalFiles, percentage, filePath]()
             {
-                emit fileChecked(
-                    displayName,
-                    verdict,
-                    details
-                );
+                emit fileChecked(displayName, verdict, details);
 
                 emit progressChanged(
                     percentage,
                     checkedFiles,
                     totalFiles,
-                    filePath
-                );
+                    filePath);
             },
-            Qt::QueuedConnection
-        );
+            Qt::QueuedConnection);
     }
 
     finish();

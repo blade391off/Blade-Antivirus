@@ -1,19 +1,31 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 
 #include "scanner.h"
 #include "hash_detector.h"
+#include "scanner/pe_analyzer.h"
+#include "scanner/scan_cache.h"
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <mscat.h>
 
 #include <array>
 #include <cstring>
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
-// Older SDKs do not define the cloud-recall attributes.
+
 #ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
 #define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
 #endif
@@ -25,13 +37,13 @@ namespace
 {
     constexpr DWORD kReadBufferSize = 256 * 1024;
 
-    // Opening these would make Windows download the file from the cloud.
+    
     constexpr DWORD kCloudMask =
         FILE_ATTRIBUTE_OFFLINE
         | FILE_ATTRIBUTE_RECALL_ON_OPEN
         | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
-    // SHA-256 of an empty file.
+    
     constexpr char kEmptySha256[] =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -65,8 +77,7 @@ namespace
         return s;
     }
 
-    // PE detection works on the first buffer. If the PE header lies further
-    // into the file (e_lfanew beyond the buffer) the caller reads it directly.
+    
     enum class PeProbe { No, Yes, Far };
 
     PeProbe ProbePE(const UCHAR* data, std::size_t size, std::uint64_t& farOffset)
@@ -137,6 +148,131 @@ namespace
         result.verdict = "SKIPPED";
         return result;
     }
+
+    
+    
+
+    bool RunWinVerifyTrust(WINTRUST_DATA& data)
+    {
+        GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        const HWND noUi = reinterpret_cast<HWND>(INVALID_HANDLE_VALUE);
+
+        data.cbStruct = sizeof(data);
+        data.dwUIChoice = WTD_UI_NONE;
+        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+        data.dwStateAction = WTD_STATEACTION_VERIFY;
+
+        const LONG status = WinVerifyTrust(noUi, &action, &data);
+
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(noUi, &action, &data);
+
+        return status == ERROR_SUCCESS;
+    }
+
+    bool VerifyEmbeddedSignature(const std::wstring& path)
+    {
+        WINTRUST_FILE_INFO fileInfo{};
+        fileInfo.cbStruct = sizeof(fileInfo);
+        fileInfo.pcwszFilePath = path.c_str();
+
+        WINTRUST_DATA data{};
+        data.dwUnionChoice = WTD_CHOICE_FILE;
+        data.pFile = &fileInfo;
+
+        return RunWinVerifyTrust(data);
+    }
+
+    // windows system files are usually signed through security catalogs
+    
+    bool VerifyCatalogSignature(const std::wstring& path)
+    {
+        FileHandle file;
+        file.h = CreateFileW(
+            path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (file.h == INVALID_HANDLE_VALUE)
+            return false;
+
+        HCATADMIN admin = nullptr;
+
+        if (!CryptCATAdminAcquireContext(&admin, nullptr, 0))
+            return false;
+
+        bool trusted = false;
+        DWORD hashSize = 0;
+
+        CryptCATAdminCalcHashFromFileHandle(file.h, &hashSize, nullptr, 0);
+
+        if (hashSize > 0 && hashSize <= 64)
+        {
+            std::vector<BYTE> hash(hashSize);
+
+            if (CryptCATAdminCalcHashFromFileHandle(
+                    file.h, &hashSize, hash.data(), 0))
+            {
+                HCATINFO catalog = CryptCATAdminEnumCatalogFromHash(
+                    admin, hash.data(), hashSize, 0, nullptr);
+
+                if (catalog)
+                {
+                    CATALOG_INFO info{};
+                    info.cbStruct = sizeof(info);
+
+                    if (CryptCATCatalogInfoFromContext(catalog, &info, 0))
+                    {
+                        static const wchar_t kHex[] = L"0123456789ABCDEF";
+                        std::wstring tag;
+
+                        for (DWORD i = 0; i < hashSize; ++i)
+                        {
+                            tag.push_back(kHex[hash[i] >> 4]);
+                            tag.push_back(kHex[hash[i] & 0x0F]);
+                        }
+
+                        WINTRUST_CATALOG_INFO catalogInfo{};
+                        catalogInfo.cbStruct = sizeof(catalogInfo);
+                        catalogInfo.pcwszCatalogFilePath = info.wszCatalogFile;
+                        catalogInfo.pcwszMemberTag = tag.c_str();
+                        catalogInfo.pcwszMemberFilePath = path.c_str();
+                        catalogInfo.hMemberFile = file.h;
+                        catalogInfo.pbCalculatedFileHash = hash.data();
+                        catalogInfo.cbCalculatedFileHash = hashSize;
+                        catalogInfo.hCatAdmin = admin;
+
+                        WINTRUST_DATA data{};
+                        data.dwUnionChoice = WTD_CHOICE_CATALOG;
+                        data.pCatalog = &catalogInfo;
+
+                        trusted = RunWinVerifyTrust(data);
+                    }
+
+                    CryptCATAdminReleaseCatalogContext(admin, catalog, 0);
+                }
+            }
+        }
+
+        CryptCATAdminReleaseContext(admin, 0);
+        return trusted;
+    }
+
+   
+    bool IsTrustedSigned(const std::filesystem::path& filePath)
+    {
+        std::filesystem::path p = filePath;
+        const std::wstring path = p.make_preferred().wstring();
+
+        return VerifyEmbeddedSignature(path) || VerifyCatalogSignature(path);
+    }
+
+    std::uint64_t FileTimeToU64(const FILETIME& ft)
+    {
+        return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32)
+            | ft.dwLowDateTime;
+    }
 }
 
 struct Scanner::Impl
@@ -145,6 +281,10 @@ struct Scanner::Impl
     DWORD objectSize = 0;
     std::vector<UCHAR> object;
     std::vector<UCHAR> buffer;
+	std::vector<UCHAR> image; // pe file held in memory for analysis
+
+    blade::ScanCache cache;
+    std::filesystem::path cachePath;
 
     ~Impl()
     {
@@ -156,7 +296,9 @@ struct Scanner::Impl
 Scanner::Scanner() = default;
 Scanner::~Scanner() = default;
 
-bool Scanner::initialize(const std::filesystem::path& databasePath)
+bool Scanner::initialize(
+    const std::filesystem::path& databasePath,
+    const std::filesystem::path& cachePath)
 {
     auto impl = std::make_unique<Impl>();
     DWORD resultSize = 0;
@@ -187,11 +329,23 @@ bool Scanner::initialize(const std::filesystem::path& databasePath)
     if (!detector->loadDatabase(databasePath))
         return false;
 
-    // Commit only when everything succeeded.
+    if (!cachePath.empty())
+    {
+        impl->cachePath = cachePath;
+        impl->cache.load(cachePath, kEngineVersion);
+    }
+
+    
     impl_ = std::move(impl);
     detector_ = std::move(detector);
 
     return true;
+}
+
+void Scanner::saveCache()
+{
+    if (impl_ && !impl_->cachePath.empty() && impl_->cache.dirty())
+        impl_->cache.save(impl_->cachePath, kEngineVersion);
 }
 
 std::size_t Scanner::databaseSize() const
@@ -204,7 +358,7 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
     ScanResult result;
     result.file = filePath.wstring();
 
-    // Fail loudly: never report CLEAN without a loaded database.
+    
     if (!impl_ || !detector_)
         return Error(std::move(result), ERROR_NOT_READY);
 
@@ -224,16 +378,33 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
     const std::uint64_t size =
         (static_cast<std::uint64_t>(attributes.nFileSizeHigh) << 32)
         | attributes.nFileSizeLow;
+    const std::uint64_t mtime = FileTimeToU64(attributes.ftLastWriteTime);
 
     if ((attributes.dwFileAttributes & kCloudMask) || size > kMaxFileSize)
         return Skipped(std::move(result));
 
-    // An empty file cannot be malware and needs no open/hash.
+    
     if (size == 0)
     {
         result.sha256 = kEmptySha256;
         result.verdict = "CLEAN";
         return result;
+    }
+
+    
+    {
+        HashDetector::Digest cached{};
+
+        if (impl_->cache.find(filePath, size, mtime, cached))
+        {
+            std::array<UCHAR, 32> digest{};
+            std::memcpy(digest.data(), cached.data(), digest.size());
+
+            result.sha256 = ToHex(digest);
+            result.hashMatch = detector_->contains(cached);
+            result.verdict = result.hashMatch ? "MALICIOUS" : "CLEAN";
+            return result;
+        }
     }
 
     FileHandle file;
@@ -269,6 +440,7 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
     }
 
     bool first = true;
+    bool collect = false; // keep the file in memory for PE analysis
     PeProbe peProbe = PeProbe::No;
     std::uint64_t peFarOffset = 0;
 
@@ -276,7 +448,7 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
     {
         DWORD bytesRead = 0;
 
-        // A failed read must be an ERROR, not a silently truncated hash.
+        
         if (!ReadFile(
                 file.h,
                 impl_->buffer.data(),
@@ -294,6 +466,31 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
         {
             peProbe = ProbePE(impl_->buffer.data(), bytesRead, peFarOffset);
             first = false;
+
+            
+            if (size <= kMaxAnalyzeSize && bytesRead >= 2
+                && impl_->buffer[0] == 'M' && impl_->buffer[1] == 'Z')
+            {
+                collect = true;
+                impl_->image.clear();
+                impl_->image.reserve(static_cast<std::size_t>(size));
+            }
+        }
+
+        if (collect)
+        {
+            if (impl_->image.size() + bytesRead > kMaxAnalyzeSize)
+            {
+                collect = false; 
+                impl_->image.clear();
+            }
+            else
+            {
+                impl_->image.insert(
+                    impl_->image.end(),
+                    impl_->buffer.begin(),
+                    impl_->buffer.begin() + bytesRead);
+            }
         }
 
         if (BCryptHashData(
@@ -311,19 +508,66 @@ ScanResult Scanner::scan(const std::filesystem::path& filePath)
         return Error(std::move(result), ERROR_INVALID_DATA);
     }
 
-    // Hashing is done, so the file pointer may move now.
-    if (peProbe == PeProbe::Yes)
-        result.isPE = true;
-    else if (peProbe == PeProbe::Far && peFarOffset + sizeof(DWORD) <= size)
-        result.isPE = ReadPeSignatureAt(file.h, peFarOffset);
-
     result.sha256 = ToHex(digest);
 
     HashDetector::Digest key{};
     std::memcpy(key.data(), digest.data(), key.size());
 
+    // 2. Blocklist.
     result.hashMatch = detector_->contains(key);
-    result.verdict = result.hashMatch ? "MALICIOUS" : "CLEAN";
+
+    if (result.hashMatch)
+    {
+        result.isPE = peProbe == PeProbe::Yes;
+        result.verdict = "MALICIOUS";
+        impl_->image.clear();
+        return result;
+    }
+
+    // 3 + 4. Static PE heuristics, softened by a valid signature.
+    if (collect && !impl_->image.empty())
+    {
+        const blade::PeReport report =
+            blade::analyzePe(impl_->image.data(), impl_->image.size());
+
+        // Release big buffers so a scan does not pin 32 MB for its lifetime.
+        if (impl_->image.capacity() > (8u << 20))
+            std::vector<UCHAR>().swap(impl_->image);
+        else
+            impl_->image.clear();
+
+        if (report.valid)
+        {
+            result.isPE = true;
+            result.heuristicScore = report.score;
+
+            if (report.score >= blade::kSuspiciousThreshold
+                && !IsTrustedSigned(filePath))
+            {
+                for (const std::string& reason : report.reasons)
+                {
+                    if (!result.details.empty())
+                        result.details += "; ";
+
+                    result.details += reason;
+                }
+
+                result.verdict = "SUSPICIOUS";
+                return result; // never cached: re-evaluated every scan
+            }
+        }
+    }
+    else
+    {
+        // Too big for full analysis (or not a PE): cheap header probe only.
+        if (peProbe == PeProbe::Yes)
+            result.isPE = true;
+        else if (peProbe == PeProbe::Far && peFarOffset + sizeof(DWORD) <= size)
+            result.isPE = ReadPeSignatureAt(file.h, peFarOffset);
+    }
+
+    result.verdict = "CLEAN";
+    impl_->cache.add(filePath, size, mtime, key);
 
     return result;
 }

@@ -22,3 +22,13 @@
 
 /[Oo]ut/
 /[Bb]uild/
+
+/.vs/
+/build/
+/build-qt/
+/build-msvc/
+/out/
+/release/
+/README-local.txt
+/README-github.txt
+/src/appicon.aps

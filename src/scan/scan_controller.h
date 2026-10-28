@@ -1,7 +1,9 @@
+
 #pragma once
 
 #include <QObject>
 #include <QString>
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -17,8 +19,7 @@ public:
 
     Q_INVOKABLE bool startScan(
         const QString& targetPath,
-        bool recursive = true
-    );
+        bool recursive = true);
 
     Q_INVOKABLE void pauseScan();
     Q_INVOKABLE void resumeScan();
@@ -31,20 +32,17 @@ signals:
         int percentage,
         int checkedFiles,
         int totalFiles,
-        const QString& currentFile
-    );
+        const QString& currentFile);
 
     void fileChecked(
         const QString& displayName,
         const QString& verdict,
-        const QString& details
-    );
+        const QString& details);
 
     void scanFinished(
         int checkedFiles,
         int threatsFound,
-        bool cancelled
-    );
+        bool cancelled);
 
 private:
     void runScan(QString targetPath, bool recursive);

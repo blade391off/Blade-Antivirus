@@ -1,54 +1,35 @@
-
+import QtQuick.Dialogs
+import QtQuick.Window
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Dialogs
 import QtQuick.Layouts
-import QtQuick.Window
 
 ApplicationWindow {
     id: root
 
-    visible: true
-    visibility: Window.Windowed
     width: 1180
     height: 760
     minimumWidth: 960
     minimumHeight: 640
+    visible: false  // main.cpp shows it (or keeps it in the tray)
     title: "BladeAntivirus"
     color: "#0B0E14"
 
-    property string activePage: "Home"
-    property string statusMessage: "Protection ready"
-    property bool realTimeProtection: true
-    property bool automaticUpdates: true
-
-    property bool scanRunning: false
-    property bool scanPaused: false
-    property int scanProgress: 0
-    property int scannedFiles: 0
-    property int totalFiles: 0
-    property int detectedThreats: 0
-    property string currentScanFile: "Waiting..."
-    property string scanMode: "Quick scan"
-    property var scanResults: []
-
-    property url logoUrl: "file:///D:/BladeAntivirus/logo.ico"
-
-    readonly property color panel: "#111620"
-    readonly property color panelLight: "#171E2A"
-    readonly property color borderColor: "#252E3C"
-    readonly property color muted: "#8793A5"
-    readonly property color accent: "#38D6A3"
-    readonly property color blue: "#6C91FF"
-    readonly property color danger: "#FF6B78"
-    readonly property color warning: "#E9B965"
+    onClosing: function(close) {
+        // Hide to the tray instead of quitting; "Exit" lives in the tray menu.
+        if (trayAvailable) {
+            close.accepted = false
+            root.hide()
+        }
+    }
 
     Shortcut {
         sequence: "F11"
         onActivated: {
             root.visibility =
                 root.visibility === Window.FullScreen
-                ? Window.Windowed : Window.FullScreen
+                ? Window.Windowed
+                : Window.FullScreen
         }
     }
 
@@ -60,145 +41,17 @@ ApplicationWindow {
         }
     }
 
-    function navigate(page) {
-        activePage = page
-    }
-
-    function shortFileName(path) {
-        var name = String(path)
-        var separator = Math.max(name.lastIndexOf("/"),
-                                 name.lastIndexOf("\\"))
-        name = name.substring(separator + 1)
-
-        if (name.length > 8)
-            return name.substring(0, 7) + "…"
-
-        return name
-    }
-
-    function hasScanController() {
-        return typeof scanController !== "undefined"
-    }
-
-    function prepareScan(mode) {
-        if (scanRunning) {
-            statusMessage = "A scan is already running."
-            return false
-        }
-
-        scanMode = mode
-        scanProgress = 0
-        scannedFiles = 0
-        totalFiles = 0
-        detectedThreats = 0
-        currentScanFile = "Preparing scan..."
-        scanResults = []
-        scanPaused = false
-        statusMessage = "Preparing " + mode.toLowerCase() + "..."
-        activePage = "Scan"
-        return true
-    }
-
-    function runQuickScan() {
-        if (!prepareScan("Quick scan"))
-            return
-
-        if (!hasScanController()) {
-            statusMessage = "Scanner is not connected in main.cpp."
-            currentScanFile = "Scanner unavailable"
-            return
-        }
-
-        if (!scanController.startQuickScan()) {
-            statusMessage = "Could not start quick scan."
-            currentScanFile = "Unable to start"
-        } else {
-            scanRunning = true
-        }
-    }
-
-    function runFullScan() {
-        if (!prepareScan("Full scan"))
-            return
-
-        if (!hasScanController()) {
-            statusMessage = "Scanner is not connected in main.cpp."
-            currentScanFile = "Scanner unavailable"
-            return
-        }
-
-        if (!scanController.startFullScan()) {
-            statusMessage = "Could not start full scan."
-            currentScanFile = "Unable to start"
-        } else {
-            scanRunning = true
-        }
-    }
-
-    function runCustomScan() {
-        if (!scanRunning)
-            customScanFolderDialog.open()
-        else
-            statusMessage = "Stop the current scan before starting another."
-    }
-
-    function startCustomScan(folderUrl) {
-        if (!prepareScan("Custom scan"))
-            return
-
-        if (!hasScanController()) {
-            statusMessage = "Scanner is not connected in main.cpp."
-            currentScanFile = "Scanner unavailable"
-            return
-        }
-
-        var localPath = folderUrl.toLocalFile()
-
-        if (!localPath || localPath.length === 0) {
-            statusMessage = "Invalid folder selected."
-            currentScanFile = "Invalid folder"
-            return
-        }
-
-        if (!scanController.startScan(localPath, true)) {
-            statusMessage = "Could not start custom scan."
-            currentScanFile = "Unable to start"
-        } else {
-            scanRunning = true
-        }
-    }
-
-    function pauseCurrentScan() {
-        if (hasScanController() && scanRunning && !scanPaused) {
-            scanController.pauseScan()
-            scanPaused = true
-            statusMessage = "Pause requested..."
-        }
-    }
-
-    function resumeCurrentScan() {
-        if (hasScanController() && scanRunning && scanPaused) {
-            scanController.resumeScan()
-            scanPaused = false
-            statusMessage = "Resuming scan..."
-        }
-    }
-
-    function stopCurrentScan() {
-        if (hasScanController() && scanRunning) {
-            scanController.cancelScan()
-            statusMessage = "Stopping scan..."
-        }
-    }
-
     FolderDialog {
         id: customScanFolderDialog
         title: "Select a folder for custom scan"
 
-        onAccepted: root.startCustomScan(selectedFolder)
+        onAccepted: {
+            root.scanKind = "Custom scan"
+            antivirusController.startCustomScan(selectedFolder)
+        }
 
         onRejected: {
-            root.statusMessage = "Folder selection cancelled."
+            root.statusMessage = "Scan cancelled."
         }
     }
 
@@ -213,70 +66,161 @@ ApplicationWindow {
             root.statusMessage = message
         }
 
+        function onScanningChanged() {
+            if (antivirusController.scanning)
+                root.beginScanUi()
+        }
+
+        function onScanStats(scanned, detected, suspicious, errors, skipped, elapsedMs, currentFile) {
+            root.scanScanned = scanned
+            root.scanDetected = detected
+            root.scanSuspicious = suspicious
+            root.scanErrors = errors
+            root.scanSkipped = skipped
+            root.scanElapsedMs = elapsedMs
+            root.scanCurrentFile = currentFile
+        }
+
+        function onFileScanned(path, verdict, sha256, details) {
+            if (verdict === "MALICIOUS" || verdict === "SUSPICIOUS")
+                threatsModel.append({ path: path, verdict: verdict, sha256: sha256, details: details })
+        }
+
+        function onScanSummary(scanned, detected, suspicious, errors, skipped, elapsedMs, stopped, failure) {
+            root.scanScanned = scanned
+            root.scanDetected = detected
+            root.scanSuspicious = suspicious
+            root.scanErrors = errors
+            root.scanSkipped = skipped
+            root.scanElapsedMs = elapsedMs
+            root.scanCurrentFile = ""
+            root.scanStoppedFlag = stopped
+            root.scanFailure = failure
+            root.scanDone = true
+        }
+
         function onScanFinished(scanned, detected, errors) {
             root.statusMessage =
                 "Scan finished | Files: " + scanned
                 + " | Threats: " + detected
-                + " | Errors: " + errors
+                + " | Unreadable: " + errors
         }
     }
 
-    Connections {
-        target: typeof scanController !== "undefined"
-                ? scanController : null
+    property string activePage: "Home"
+    property string statusMessage: "Protection ready"
+    property bool realTimeProtection: true
+    property bool automaticUpdates: true
 
-        function onStatusChanged(status) {
-            root.statusMessage = status
+    // Scan window state
+    property string scanKind: ""
+    property int scanScanned: 0
+    property int scanDetected: 0
+    property int scanSuspicious: 0
+    property int scanErrors: 0
+    property int scanSkipped: 0
+    property double scanElapsedMs: 0
+    property string scanCurrentFile: ""
+    property string scanFailure: ""
+    property bool scanDone: false
+    property bool scanStoppedFlag: false
+    property bool stopRequested: false
 
-            if (status === "Scanning")
-                root.scanRunning = true
+    readonly property color panel: "#111620"
+    readonly property color panelLight: "#171E2A"
+    readonly property color borderColor: "#252E3C"
+    readonly property color muted: "#8793A5"
+    readonly property color accent: "#38D6A3"
+    readonly property color blue: "#6C91FF"
 
-            if (status === "Scan completed"
-                    || status === "Scan cancelled"
-                    || status === "Failed to load hash database"
-                    || status === "No files found") {
-                root.scanRunning = false
-                root.scanPaused = false
-            }
-        }
+    function navigate(page) {
+        activePage = page
+    }
 
-        function onProgressChanged(percentage, checked, total, currentFile) {
-            root.scanProgress = Math.max(0, Math.min(100, percentage))
-            root.scannedFiles = checked
-            root.totalFiles = total
-            root.currentScanFile = root.shortFileName(currentFile)
-        }
+    function pad2(n) {
+        return n < 10 ? "0" + n : "" + n
+    }
 
-        function onFileChecked(displayName, verdict, details) {
-            var updated = root.scanResults.slice()
+    function formatElapsed(ms) {
+        var total = Math.floor(ms / 1000)
+        var h = Math.floor(total / 3600)
+        var m = Math.floor((total % 3600) / 60)
+        var s = total % 60
+        return (h > 0 ? h + ":" : "") + pad2(m) + ":" + pad2(s)
+    }
 
-            updated.unshift({
-                "name": root.shortFileName(displayName),
-                "verdict": verdict,
-                "details": details
-            })
+    function formatCount(n) {
+        return Number(n).toLocaleString(Qt.locale(), "f", 0)
+    }
 
-            if (updated.length > 200)
-                updated.pop()
+    function beginScanUi() {
+        threatsModel.clear()
+        scanScanned = 0
+        scanDetected = 0
+        scanSuspicious = 0
+        scanErrors = 0
+        scanSkipped = 0
+        scanElapsedMs = 0
+        scanCurrentFile = ""
+        scanFailure = ""
+        scanDone = false
+        scanStoppedFlag = false
+        stopRequested = false
+        scanPopup.open()
+    }
 
-            root.scanResults = updated
-        }
+    function scanTitle() {
+        if (scanFailure !== "")
+            return "Scan could not run"
+        if (!scanDone)
+            return stopRequested ? "Stopping scan..."
+                                 : (scanKind !== "" ? scanKind : "Scan") + " in progress"
+        if (scanStoppedFlag)
+            return "Scan stopped"
+        if (scanDetected > 0)
+            return "Threats found"
+        return scanSuspicious > 0 ? "Suspicious files found" : "No threats found"
+    }
 
-        function onScanFinished(checked, threats, wasCancelled) {
-            root.scanRunning = false
-            root.scanPaused = false
-            root.scannedFiles = checked
-            root.detectedThreats = threats
+    function scanSubtitle() {
+        if (!scanDone)
+            return "Checking files against the Blade database"
+        if (scanFailure !== "")
+            return "Nothing was scanned"
+        return "Checked " + formatCount(scanScanned) + " files in " + formatElapsed(scanElapsedMs)
+    }
 
-            if (wasCancelled) {
-                root.statusMessage = "Scan cancelled."
-                root.currentScanFile = "Scan stopped"
-            } else {
-                root.scanProgress = 100
-                root.statusMessage = "Scan completed."
-                root.currentScanFile = "Finished"
-            }
-        }
+    function scanTone() {
+        if (scanFailure !== "" || (scanDone && scanDetected > 0))
+            return "#FF6B6B"
+        if (scanDone && scanSuspicious > 0)
+            return "#E5B45C"
+        if (scanDone)
+            return accent
+        return blue
+    }
+
+    function scanSymbol() {
+        if (scanFailure !== "")
+            return "✕"
+        if (!scanDone)
+            return "⌕"
+        return (scanDetected > 0 || scanSuspicious > 0) ? "!" : "✓"
+    }
+
+    function runQuickScan() {
+        scanKind = "Quick scan"
+        antivirusController.startQuickScan()
+    }
+
+    function runFullScan() {
+        scanKind = "Full scan"
+        antivirusController.startFullScan()
+    }
+
+    function runCustomScan() {
+        scanKind = "Custom scan"
+        customScanFolderDialog.open()
     }
 
     Rectangle {
@@ -287,7 +231,7 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 0
 
-            // SIDEBAR
+            // Left panel
             Rectangle {
                 Layout.preferredWidth: 226
                 Layout.fillHeight: true
@@ -315,7 +259,7 @@ ApplicationWindow {
                             Image {
                                 id: logoImage
                                 anchors.fill: parent
-                                source: root.logoUrl
+                                source: logoUrl
                                 fillMode: Image.PreserveAspectCrop
                                 smooth: true
                                 visible: status === Image.Ready
@@ -378,8 +322,7 @@ ApplicationWindow {
                             radius: 9
 
                             color: root.activePage === modelData.name
-                                   ? "#1B2930"
-                                   : navMouse.containsMouse
+                                   ? "#1B2930" : navMouse.containsMouse
                                      ? "#171E28" : "transparent"
 
                             Rectangle {
@@ -453,8 +396,7 @@ ApplicationWindow {
                                     width: 7
                                     height: 7
                                     radius: 4
-                                    color: root.scanRunning
-                                           ? root.blue : root.accent
+                                    color: root.accent
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
@@ -508,7 +450,7 @@ ApplicationWindow {
                             }
                         }
 
-                        MouseArea {
+                            MouseArea {
                             id: settingsMouse
                             anchors.fill: parent
                             hoverEnabled: true
@@ -519,7 +461,7 @@ ApplicationWindow {
                 }
             }
 
-            // MAIN CONTENT
+            // Main workspace
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -551,7 +493,7 @@ ApplicationWindow {
                             color: "#151D27"
                             border.color: "#283443"
                             Layout.preferredHeight: 34
-                            Layout.preferredWidth: 145
+                            Layout.preferredWidth: 135
 
                             Row {
                                 anchors.centerIn: parent
@@ -562,7 +504,7 @@ ApplicationWindow {
                                     height: 7
                                     radius: 4
                                     color: root.realTimeProtection
-                                           ? root.accent : root.warning
+                                           ? root.accent : "#E5B45C"
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
@@ -581,7 +523,6 @@ ApplicationWindow {
                     id: pages
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-
                     currentIndex: {
                         switch (root.activePage) {
                         case "Home": return 0
@@ -627,6 +568,16 @@ ApplicationWindow {
                                     y: -125
                                 }
 
+                                Rectangle {
+                                    width: 180
+                                    height: 180
+                                    radius: 90
+                                    color: "#1A493A"
+                                    opacity: 0.4
+                                    x: parent.width - 125
+                                    y: 75
+                                }
+
                                 ColumnLayout {
                                     anchors.fill: parent
                                     anchors.margins: 25
@@ -650,15 +601,15 @@ ApplicationWindow {
                                             }
                                         }
 
-                                        Text {
-                                            text: root.realTimeProtection
-                                                  ? "YOUR PROTECTION IS ACTIVE"
-                                                  : "ATTENTION REQUIRED"
-                                            color: root.accent
-                                            font.pixelSize: 11
-                                            font.bold: true
-                                            font.letterSpacing: 1
-                                        }
+                                Text {
+                                    text: root.realTimeProtection
+                                          ? "YOUR PROTECTION IS ACTIVE"
+                                          : "ATTENTION REQUIRED"
+                                    color: root.accent
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    font.letterSpacing: 1
+                                }
                                     }
 
                                     Text {
@@ -683,7 +634,7 @@ ApplicationWindow {
                                         spacing: 10
 
                                         Button {
-                                            text: "Quick Scan"
+                                            text: "  Quick Scan  "
                                             onClicked: root.runQuickScan()
 
                                             background: Rectangle {
@@ -741,26 +692,19 @@ ApplicationWindow {
                                 rowSpacing: 13
 
                                 Repeater {
-                                    model: [
-                                        {
-                                            title: "Real-time protection",
-                                            value: root.realTimeProtection
-                                                   ? "Active" : "Off",
-                                            detail: "Module status",
-                                            symbol: "◇"
-                                        },
-                                        {
-                                            title: "Files scanned",
-                                            value: String(root.scannedFiles),
-                                            detail: "Current session",
-                                            symbol: "↻"
-                                        },
-                                        {
-                                            title: "Threats detected",
-                                            value: String(root.detectedThreats),
-                                            detail: "Current session",
-                                            symbol: "⌕"
-                                        }
+                                        model: [
+                                        { title: "Real-time protection",
+                                          value: root.realTimeProtection ? "Active" : "Off",
+                                          detail: "Module status",
+                                          symbol: "◇" },
+                                        { title: "Threat databases",
+                                          value: "Not checked",
+                                          detail: "Check updates",
+                                          symbol: "↻" },
+                                        { title: "Last scan",
+                                          value: "No data",
+                                          detail: "Run the first scan",
+                                          symbol: "⌕" }
                                     ]
 
                                     delegate: Rectangle {
@@ -821,11 +765,19 @@ ApplicationWindow {
                                     anchors.margins: 16
                                     spacing: 12
 
-                                    Text {
-                                        text: "i"
-                                        color: root.blue
-                                        font.pixelSize: 22
-                                        font.bold: true
+                                    Rectangle {
+                                        width: 34
+                                        height: 34
+                                        radius: 9
+                                        color: "#202B3D"
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: "i"
+                                            color: root.blue
+                                            font.pixelSize: 18
+                                            font.bold: true
+                                        }
                                     }
 
                                     ColumnLayout {
@@ -833,7 +785,7 @@ ApplicationWindow {
                                         spacing: 4
 
                                         Text {
-                                            text: "Blade Engine status"
+                                                text: "Blade Engine status"
                                             color: "#E6ECF5"
                                             font.pixelSize: 12
                                             font.bold: true
@@ -844,7 +796,6 @@ ApplicationWindow {
                                             color: root.muted
                                             font.pixelSize: 11
                                             wrapMode: Text.WordWrap
-                                            Layout.fillWidth: true
                                         }
                                     }
                                 }
@@ -852,550 +803,169 @@ ApplicationWindow {
                         }
                     }
 
-                    // SCAN — EMBEDDED IN THE MAIN WINDOW
+                    // SCAN
                     Flickable {
-                        id: scanFlick
                         clip: true
-                        contentWidth: width
+                        contentWidth: width    
                         contentHeight: scanColumn.implicitHeight
                         ScrollBar.vertical: ScrollBar {}
 
                         ColumnLayout {
                             id: scanColumn
-                            width: scanFlick.width
-                            spacing: 15
+                            width: parent.width
+                            spacing: 17
 
-                            Item { Layout.preferredHeight: 2 }
+                            Item { Layout.preferredHeight: 5 }
 
-                            RowLayout {
+                            Text {
+                                Layout.leftMargin: 28
+                                text: "Choose scan type"
+                                color: "#EFF3F8"
+                                font.pixelSize: 21
+                                font.bold: true
+                            }
+
+                            Text {
                                 Layout.leftMargin: 28
                                 Layout.rightMargin: 28
-                                Layout.fillWidth: true
+                                text: "Scan files and look for known threats using the Blade engine."
+                                color: root.muted
+                                font.pixelSize: 12
+                                wrapMode: Text.WordWrap
+                            }
 
-                                ColumnLayout {
+                            Repeater {
+                                model: [
+                                    { name: "Quick scan",
+                                      desc: "Quick search for threats in selected areas.",
+                                      symbol: "⌕", kind: "quick" },
+                                    { name: "Full scan",
+                                      desc: "Deeper system file scan.",
+                                      symbol: "▦", kind: "full" },
+                                    { name: "Custom scan",
+                                      desc: "Choose specific files and folders to scan.",
+                                      symbol: "＋", kind: "custom" }
+                                ]
+
+                                delegate: Rectangle {
                                     Layout.fillWidth: true
-                                    spacing: 5
+                                    Layout.leftMargin: 28
+                                    Layout.rightMargin: 28
+                                    Layout.preferredHeight: 115
+                                    radius: 13
+                                    color: root.panel
+                                    border.color: scanCardMouse.containsMouse
+                                                  ? "#3B5265" : root.borderColor
 
-                                    Text {
-                                        text: "Security Scanner"
-                                        color: "#EFF3F8"
-                                        font.pixelSize: 23
-                                        font.bold: true
+                                    Behavior on border.color {
+                                        ColorAnimation { duration: 120 }
                                     }
-
-                                    Text {
-                                        text: "Scan your files for known threats."
-                                        color: root.muted
-                                        font.pixelSize: 12
-                                        wrapMode: Text.WordWrap
-                                    }
-                                }
-
-                                Rectangle {
-                                    radius: 9
-                                    color: root.scanRunning
-                                           ? "#172A40" : "#13251F"
-                                    border.color: root.scanRunning
-                                                  ? "#314D70" : "#23513F"
-                                    implicitWidth: stateText.implicitWidth + 22
-                                    implicitHeight: 34
-
-                                    Text {
-                                        id: stateText
-                                        anchors.centerIn: parent
-                                        text: root.scanRunning
-                                              ? (root.scanPaused ? "PAUSED" : "SCANNING")
-                                              : "READY"
-                                        color: root.scanRunning
-                                               ? root.blue : root.accent
-                                        font.pixelSize: 10
-                                        font.bold: true
-                                    }
-                                }
-                            }
-
-                            // Scan type cards
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Layout.leftMargin: 28
-                                Layout.rightMargin: 28
-                                spacing: 10
-
-                                Repeater {
-                                    model: [
-                                        {
-                                            name: "Quick",
-                                            desc: "Quick scan",
-                                            symbol: "⌕",
-                                            kind: "quick"
-                                        },
-                                        {
-                                            name: "Full",
-                                            desc: "Full scan",
-                                            symbol: "▦",
-                                            kind: "full"
-                                        },
-                                        {
-                                            name: "Custom",
-                                            desc: "Choose folder",
-                                            symbol: "＋",
-                                            kind: "custom"
-                                        }
-                                    ]
-
-                                    delegate: Rectangle {
-                                        Layout.fillWidth: true
-                                        Layout.preferredHeight: 83
-                                        radius: 12
-                                        color: root.scanMode === modelData.desc
-                                               ? "#172A28" : root.panel
-                                        border.color: root.scanMode === modelData.desc
-                                                      ? "#2E8067" : root.borderColor
-
-                                        ColumnLayout {
-                                            anchors.fill: parent
-                                            anchors.margins: 11
-                                            spacing: 5
-
-                                            RowLayout {
-                                                spacing: 7
-
-                                                Text {
-                                                    text: modelData.symbol
-                                                    color: root.accent
-                                                    font.pixelSize: 19
-                                                }
-
-                                                Text {
-                                                    text: modelData.name
-                                                    color: "#EAF0F7"
-                                                    font.pixelSize: 12
-                                                    font.bold: true
-                                                }
-                                            }
-
-                                            Text {
-                                                text: modelData.desc
-                                                color: root.muted
-                                                font.pixelSize: 10
-                                                wrapMode: Text.WordWrap
-                                                Layout.fillWidth: true
-                                            }
-                                        }
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: {
-                                                if (modelData.kind === "quick")
-                                                    root.runQuickScan()
-                                                else if (modelData.kind === "full")
-                                                    root.runFullScan()
-                                                else
-                                                    root.runCustomScan()
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Main scan progress panel
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.leftMargin: 28
-                                Layout.rightMargin: 28
-                                Layout.preferredHeight: 252
-                                radius: 15
-                                color: "#111923"
-                                border.color: root.scanRunning
-                                              ? "#2A514A" : root.borderColor
-
-                                ColumnLayout {
-                                    anchors.fill: parent
-                                    anchors.margins: 20
-                                    spacing: 13
 
                                     RowLayout {
-                                        Layout.fillWidth: true
-
-                                        ColumnLayout {
-                                            Layout.fillWidth: true
-                                            spacing: 4
-
-                                            Text {
-                                                text: root.scanMode
-                                                color: "#F0F4F9"
-                                                font.pixelSize: 16
-                                                font.bold: true
-                                            }
-
-                                            Text {
-                                                text: root.scanRunning
-                                                      ? (root.scanPaused
-                                                         ? "Scan paused"
-                                                         : "Checking files...")
-                                                      : root.statusMessage
-                                                color: root.muted
-                                                font.pixelSize: 11
-                                                wrapMode: Text.WordWrap
-                                                Layout.fillWidth: true
-                                            }
-                                        }
-
-                                        Text {
-                                            text: root.scanProgress + "%"
-                                            color: root.accent
-                                            font.pixelSize: 25
-                                            font.bold: true
-                                        }
-                                    }
-
-                                    // Progress bar
-                                    Rectangle {
-                                        Layout.fillWidth: true
-                                        height: 8
-                                        radius: 4
-                                        color: "#242E3B"
-                                        clip: true
+                                        anchors.fill: parent
+                                        anchors.margins: 19
+                                        spacing: 15
 
                                         Rectangle {
-                                            width: parent.width
-                                                   * root.scanProgress / 100
-                                            height: parent.height
-                                            radius: 4
-                                            color: root.accent
-
-                                            Behavior on width {
-                                                NumberAnimation { duration: 180 }
-                                            }
-                                        }
-                                    }
-
-                                    Text {
-                                        text: root.currentScanFile
-                                        color: "#B7C4D3"
-                                        font.pixelSize: 11
-                                        elide: Text.ElideRight
-                                        Layout.fillWidth: true
-                                    }
-
-                                    Rectangle {
-                                        Layout.fillWidth: true
-                                        height: 1
-                                        color: root.borderColor
-                                    }
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 0
-
-                                        ColumnLayout {
-                                            Layout.fillWidth: true
-                                            spacing: 5
+                                            width: 47
+                                            height: 47
+                                            radius: 12
+                                            color: "#1C293B"
 
                                             Text {
-                                                text: "FILES CHECKED"
-                                                color: root.muted
-                                                font.pixelSize: 9
-                                                font.bold: true
-                                            }
-
-                                            Text {
-                                                text: root.scannedFiles
-                                                color: "#EDF2F8"
-                                                font.pixelSize: 20
-                                                font.bold: true
+                                                anchors.centerIn: parent
+                                                text: modelData.symbol
+                                                color: root.blue
+                                                font.pixelSize: 25
                                             }
                                         }
 
                                         ColumnLayout {
                                             Layout.fillWidth: true
-                                            spacing: 5
+                                            spacing: 7
 
                                             Text {
-                                                text: "TOTAL FILES"
-                                                color: root.muted
-                                                font.pixelSize: 9
-                                                font.bold: true
-                                            }
-
-                                            Text {
-                                                text: root.totalFiles > 0
-                                                      ? root.totalFiles : "—"
-                                                color: "#EDF2F8"
-                                                font.pixelSize: 20
-                                                font.bold: true
-                                            }
-                                        }
-
-                                        ColumnLayout {
-                                            Layout.fillWidth: true
-                                            spacing: 5
-
-                                            Text {
-                                                text: "THREATS"
-                                                color: root.muted
-                                                font.pixelSize: 9
-                                                font.bold: true
-                                            }
-
-                                            Text {
-                                                text: root.detectedThreats
-                                                color: root.detectedThreats > 0
-                                                       ? root.danger : root.accent
-                                                font.pixelSize: 20
-                                                font.bold: true
-                                            }
-                                        }
-                                    }
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 8
-
-                                        Button {
-                                            text: root.scanPaused
-                                                  ? "Resume" : "Pause"
-                                            enabled: root.scanRunning
-                                            onClicked: {
-                                                if (root.scanPaused)
-                                                    root.resumeCurrentScan()
-                                                else
-                                                    root.pauseCurrentScan()
-                                            }
-
-                                            background: Rectangle {
-                                                radius: 8
-                                                color: parent.enabled
-                                                       ? "#1C2D42" : "#171E27"
-                                                border.color: "#344D6B"
-                                            }
-
-                                            contentItem: Text {
-                                                text: parent.text
-                                                color: parent.enabled
-                                                       ? "#DCE8FA" : "#6D7888"
-                                                font.pixelSize: 11
-                                                horizontalAlignment: Text.AlignHCenter
-                                                verticalAlignment: Text.AlignVCenter
-                                            }
-                                        }
-
-                                        Button {
-                                            text: "Stop"
-                                            enabled: root.scanRunning
-                                            onClicked: root.stopCurrentScan()
-
-                                            background: Rectangle {
-                                                radius: 8
-                                                color: parent.enabled
-                                                       ? "#3A2028" : "#171E27"
-                                                border.color: parent.enabled
-                                                              ? "#74404B" : "#252E3C"
-                                            }
-
-                                            contentItem: Text {
-                                                text: parent.text
-                                                color: parent.enabled
-                                                       ? "#FFB7C0" : "#6D7888"
-                                                font.pixelSize: 11
-                                                horizontalAlignment: Text.AlignHCenter
-                                                verticalAlignment: Text.AlignVCenter
-                                            }
-                                        }
-
-                                        Item { Layout.fillWidth: true }
-
-                                        Text {
-                                            text: root.scanRunning
-                                                  ? "Scan in progress"
-                                                  : "Scanner ready"
-                                            color: root.muted
-                                            font.pixelSize: 10
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Scan results
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.leftMargin: 28
-                                Layout.rightMargin: 28
-                                Layout.bottomMargin: 25
-                                Layout.preferredHeight: 300
-                                radius: 14
-                                color: root.panel
-                                border.color: root.borderColor
-                                clip: true
-
-                                ColumnLayout {
-                                    anchors.fill: parent
-                                    spacing: 0
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        Layout.margins: 16
-
-                                        ColumnLayout {
-                                            Layout.fillWidth: true
-                                            spacing: 4
-
-                                            Text {
-                                                text: "Scan results"
+                                                text: modelData.name
                                                 color: "#EAF0F7"
                                                 font.pixelSize: 14
                                                 font.bold: true
                                             }
 
                                             Text {
-                                                text: root.scanResults.length
-                                                      + " recent file results"
+                                                text: modelData.desc
                                                 color: root.muted
-                                                font.pixelSize: 10
-                                            }
-                                        }
-
-                                        Rectangle {
-                                            radius: 7
-                                            color: "#1B2533"
-                                            implicitWidth: resultCount.implicitWidth + 16
-                                            implicitHeight: 27
-
-                                            Text {
-                                                id: resultCount
-                                                anchors.centerIn: parent
-                                                text: root.scanResults.length
-                                                color: "#D8E3F2"
                                                 font.pixelSize: 11
+                                                wrapMode: Text.WordWrap
+                                                Layout.fillWidth: true
+                                            }
+                                        }
+
+                                        Button {
+                                            text: "Select"
+                                            onClicked: {
+                                                if (modelData.kind === "quick")
+                                                    root.runQuickScan()
+                                                else if (modelData.kind === "full")
+                                                    root.runFullScan()
+                                                else if (modelData.kind === "custom")
+                                                    root.runCustomScan()
+                                            }
+
+                                            background: Rectangle {
+                                                radius: 8
+                                                color: parent.down
+                                                       ? "#26394E" : "#1A2637"
+                                                border.color: "#344760"
+                                            }
+
+                                            contentItem: Text {
+                                                text: parent.text
+                                                color: "#DAE5F7"
+                                                font.pixelSize: 11
+                                                horizontalAlignment: Text.AlignHCenter
+                                                verticalAlignment: Text.AlignVCenter
                                             }
                                         }
                                     }
 
-                                    Rectangle {
-                                        Layout.fillWidth: true
-                                        height: 1
-                                        color: root.borderColor
+                                   MouseArea {
+                                   id: scanCardMouse
+                                   anchors.fill: parent
+                                   hoverEnabled: true
+                                   acceptedButtons: Qt.NoButton
+                                   z: -1
+                                   }
+                                }
+                            }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 28
+                                Layout.rightMargin: 28
+                                Layout.bottomMargin: 24
+                                Layout.preferredHeight: 85
+                                radius: 12
+                                color: "#171E29"
+                                border.color: root.borderColor
+
+                                Column {
+                                    anchors.fill: parent
+                                    anchors.margins: 15
+                                    spacing: 6
+
+                                    Text {
+                                        text: "Important"
+                                        color: "#E9C078"
+                                        font.pixelSize: 12
+                                        font.bold: true
                                     }
 
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        Layout.leftMargin: 16
-                                        Layout.rightMargin: 16
-                                        Layout.topMargin: 10
-                                        Layout.bottomMargin: 8
-
                                         Text {
-                                            text: "FILE"
-                                            color: root.muted
-                                            font.pixelSize: 9
-                                            font.bold: true
-                                            Layout.fillWidth: true
-                                        }
-
-                                        Text {
-                                            text: "RESULT"
-                                            color: root.muted
-                                            font.pixelSize: 9
-                                            font.bold: true
-                                            Layout.preferredWidth: 90
-                                            horizontalAlignment: Text.AlignRight
-                                        }
-                                    }
-
-                                    ListView {
-                                        id: scanResultsList
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                        clip: true
-                                        model: root.scanResults
-                                        spacing: 0
-
-                                        ScrollBar.vertical: ScrollBar {}
-
-                                        delegate: Rectangle {
-                                            width: scanResultsList.width
-                                            height: 48
-                                            color: index % 2 === 0
-                                                   ? "#121923" : "#10161F"
-
-                                            RowLayout {
-                                                anchors.fill: parent
-                                                anchors.leftMargin: 16
-                                                anchors.rightMargin: 16
-                                                spacing: 10
-
-                                                Rectangle {
-                                                    width: 7
-                                                    height: 7
-                                                    radius: 4
-                                                    color: {
-                                                        var v = String(modelData.verdict)
-                                                                .toUpperCase()
-                                                        if (v.indexOf("MALICIOUS") >= 0
-                                                                || v.indexOf("THREAT") >= 0
-                                                                || v.indexOf("DETECTED") >= 0)
-                                                            return root.danger
-                                                        if (v.indexOf("SUSPICIOUS") >= 0)
-                                                            return root.warning
-                                                        return root.accent
-                                                    }
-                                                }
-
-                                                ColumnLayout {
-                                                    Layout.fillWidth: true
-                                                    spacing: 3
-
-                                                    Text {
-                                                        text: modelData.name
-                                                        color: "#E3EAF3"
-                                                        font.pixelSize: 11
-                                                        elide: Text.ElideRight
-                                                        Layout.fillWidth: true
-                                                    }
-
-                                                    Text {
-                                                        text: modelData.details
-                                                        color: root.muted
-                                                        font.pixelSize: 9
-                                                        elide: Text.ElideRight
-                                                        Layout.fillWidth: true
-                                                    }
-                                                }
-
-                                                Text {
-                                                    text: modelData.verdict
-                                                    color: {
-                                                        var v = String(modelData.verdict)
-                                                                .toUpperCase()
-                                                        if (v.indexOf("MALICIOUS") >= 0
-                                                                || v.indexOf("THREAT") >= 0
-                                                                || v.indexOf("DETECTED") >= 0)
-                                                            return root.danger
-                                                        if (v.indexOf("SUSPICIOUS") >= 0)
-                                                            return root.warning
-                                                        return root.accent
-                                                    }
-                                                    font.pixelSize: 9
-                                                    font.bold: true
-                                                    elide: Text.ElideRight
-                                                    Layout.preferredWidth: 90
-                                                    horizontalAlignment: Text.AlignRight
-                                                }
-                                            }
-                                        }
-
-                                        Text {
-                                            anchors.centerIn: parent
-                                            visible: root.scanResults.length === 0
-                                            text: root.scanRunning
-                                                  ? "Waiting for scan results..."
-                                                  : "No results yet. Start a scan to check files."
+                                            text: "A progress window with detailed results opens as soon as a scan starts."
                                             color: root.muted
                                             font.pixelSize: 11
-                                            horizontalAlignment: Text.AlignHCenter
+                                            wrapMode: Text.WordWrap
                                         }
-                                    }
                                 }
                             }
                         }
@@ -1432,17 +1002,13 @@ ApplicationWindow {
                             }
 
                             Repeater {
-                                model: [
-                                    {
-                                        name: "Real-time protection",
-                                        desc: "Main toggle for protection state.",
-                                        key: "realtime"
-                                    },
-                                    {
-                                        name: "Automatic updates",
-                                        desc: "Allow automatic database updates.",
-                                        key: "updates"
-                                    }
+                                    model: [
+                                    { name: "Real-time protection",
+                                      desc: "Main toggle for protection state.",
+                                      key: "realtime" },
+                                    { name: "Automatic updates",
+                                      desc: "Allow automatic database updates.",
+                                      key: "updates" }
                                 ]
 
                                 delegate: Rectangle {
@@ -1552,7 +1118,7 @@ ApplicationWindow {
 
                                 Text {
                                     width: parent.width
-                                    text: "Detected items will appear here when quarantine processing is connected."
+                                    text: "Detected items will appear here after connecting scan result processing."
                                     color: root.muted
                                     font.pixelSize: 11
                                     wrapMode: Text.WordWrap
@@ -1646,12 +1212,11 @@ ApplicationWindow {
                                     text: "Check for updates"
                                     onClicked: {
                                         if (typeof antivirusController !== "undefined"
-                                                && typeof antivirusController.checkUpdates
-                                                   === "function") {
+                                                && typeof antivirusController.checkUpdates === "function") {
                                             antivirusController.checkUpdates()
                                         } else {
                                             root.statusMessage =
-                                                "C++ updater is not connected."
+                                                "C++ updater is not yet connected to the interface"
                                         }
                                     }
 
@@ -1785,6 +1350,333 @@ ApplicationWindow {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    color: "#0E121A"
+                    border.color: "#202735"
+                    border.width: 1
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: 29
+                        anchors.rightMargin: 29
+                        verticalAlignment: Text.AlignVCenter
+                        text: root.statusMessage
+                        color: root.muted
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                    }
+                }
+            }
+        }
+    }
+
+    ListModel { id: threatsModel }
+
+    component StatCard: Rectangle {
+        id: card
+        property string label: ""
+        property string value: ""
+        property color valueColor: "#E8EDF5"
+
+        Layout.fillWidth: true
+        Layout.preferredHeight: 74
+        radius: 11
+        color: root.panelLight
+        border.color: root.borderColor
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 4
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: card.value
+                color: card.valueColor
+                font.pixelSize: 22
+                font.bold: true
+            }
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: card.label
+                color: root.muted
+                font.pixelSize: 10
+            }
+        }
+    }
+
+    Popup {
+        id: scanPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(680, root.width - 60)
+        height: Math.min(580, root.height - 60)
+        modal: true
+        focus: true
+        padding: 0
+        closePolicy: root.scanDone
+                     ? (Popup.CloseOnEscape | Popup.CloseOnPressOutside)
+                     : Popup.NoAutoClose
+
+        Overlay.modal: Rectangle { color: "#B3000000" }
+
+        background: Rectangle {
+            radius: 16
+            color: root.panel
+            border.color: root.borderColor
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 24
+                spacing: 14
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 14
+
+                    Rectangle {
+                        width: 48
+                        height: 48
+                        radius: 14
+                        color: root.panelLight
+                        border.color: root.scanTone()
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.scanSymbol()
+                            color: root.scanTone()
+                            font.pixelSize: 24
+                            font.bold: true
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 3
+
+                        Text {
+                            text: root.scanTitle()
+                            color: "#F0F4FA"
+                            font.pixelSize: 19
+                            font.bold: true
+                        }
+
+                        Text {
+                            text: root.scanSubtitle()
+                            color: root.muted
+                            font.pixelSize: 11
+                        }
+                    }
+
+                    Text {
+                        visible: !root.scanDone
+                        text: root.formatElapsed(root.scanElapsedMs)
+                        color: "#C9D3E0"
+                        font.pixelSize: 18
+                        font.bold: true
+                    }
+                }
+
+                ProgressBar {
+                    Layout.fillWidth: true
+                    visible: !root.scanDone
+                    indeterminate: true
+                    palette.dark: root.accent
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    StatCard {
+                        label: "Files scanned"
+                        value: root.formatCount(root.scanScanned)
+                    }
+
+                    StatCard {
+                        label: "Threats"
+                        value: root.formatCount(root.scanDetected)
+                        valueColor: root.scanDetected > 0 ? "#FF6B6B" : root.accent
+                    }
+
+                    StatCard {
+                        label: "Suspicious"
+                        value: root.formatCount(root.scanSuspicious)
+                        valueColor: root.scanSuspicious > 0 ? "#E5B45C" : root.accent
+                    }
+
+                    StatCard {
+                        label: "Unreadable"
+                        value: root.formatCount(root.scanErrors)
+                    }
+
+                    StatCard {
+                        label: "Skipped"
+                        value: root.formatCount(root.scanSkipped)
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: !root.scanDone
+                    spacing: 4
+
+                    Text {
+                        text: "Currently scanning"
+                        color: root.muted
+                        font.pixelSize: 10
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.scanCurrentFile !== "" ? root.scanCurrentFile : "Preparing..."
+                        color: "#C3CDDA"
+                        font.pixelSize: 11
+                        elide: Text.ElideMiddle
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    visible: root.scanFailure !== ""
+                    text: root.scanFailure
+                    color: "#FF8E8E"
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+
+                Text {
+                    visible: threatsModel.count > 0
+                    text: "Detected items (" + threatsModel.count + ")"
+                    color: "#FF8E8E"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
+
+                ListView {
+                    id: threatList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    visible: threatsModel.count > 0
+                    clip: true
+                    spacing: 8
+                    model: threatsModel
+                    ScrollBar.vertical: ScrollBar {}
+
+                    delegate: Rectangle {
+                        width: ListView.view.width
+                        height: 76
+                        radius: 10
+                        color: model.verdict === "MALICIOUS" ? "#1D1A21" : "#1F1D18"
+                        border.color: model.verdict === "MALICIOUS" ? "#4A2A31" : "#4A4128"
+
+                        Rectangle {
+                            width: 3
+                            height: parent.height - 20
+                            radius: 2
+                            color: model.verdict === "MALICIOUS" ? "#FF6B6B" : "#E5B45C"
+                            anchors.left: parent.left
+                            anchors.leftMargin: 6
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 20
+                            anchors.rightMargin: 14
+                            spacing: 3
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: model.path
+                                color: "#F0D7DA"
+                                font.pixelSize: 12
+                                font.bold: true
+                                elide: Text.ElideMiddle
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: (model.verdict === "MALICIOUS" ? "MALICIOUS · " : "SUSPICIOUS · ") + model.details
+                                color: model.verdict === "MALICIOUS" ? "#E7A0A8" : "#E5C98A"
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                                maximumLineCount: 2
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "SHA-256 " + model.sha256
+                                color: "#8A7479"
+                                font.pixelSize: 9
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+                }
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: threatsModel.count === 0
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        visible: !root.scanDone
+                        enabled: !root.stopRequested
+                        text: root.stopRequested ? "Stopping..." : "Stop scan"
+                        onClicked: {
+                            root.stopRequested = true
+                            antivirusController.stopScan()
+                        }
+
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.down ? "#7A2F38" : "#5A2830"
+                            border.color: "#8E3B46"
+                            opacity: parent.enabled ? 1.0 : 0.6
+                        }
+
+                        contentItem: Text {
+                            text: parent.text
+                            color: "#FFD9DD"
+                            font.pixelSize: 12
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    Button {
+                        visible: root.scanDone
+                        text: "  Close  "
+                        onClicked: scanPopup.close()
+
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.down ? "#24AD80" : root.accent
+                        }
+
+                        contentItem: Text {
+                            text: parent.text
+                            color: "#071711"
+                            font.pixelSize: 12
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
                         }
                     }
                 }
