@@ -15,6 +15,8 @@
 *.vsdix
 *.vs/
 *.gen
+*.d
+*.cpp.d
 
 
 /[Oo]ut/
