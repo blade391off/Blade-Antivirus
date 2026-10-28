@@ -12,3 +12,5 @@
 *.out
 *.app
 *.apk
+*.vsdix
+*.vs/
