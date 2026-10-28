@@ -15,3 +15,7 @@
 *.vsdix
 *.vs/
 *.gen
+
+
+/[Oo]ut/
+/[Bb]uild/
