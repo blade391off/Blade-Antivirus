@@ -1,8 +1,8 @@
-\# Security Policy
+# Security Policy
 
 
 
-\## Supported Versions
+## Supported Versions
 
 
 
@@ -20,7 +20,7 @@ We actively support and patch security vulnerabilities only in the latest open-s
 
 
 
-\## Reporting a Vulnerability
+## Reporting a Vulnerability
 
 
 
@@ -28,15 +28,15 @@ As a security tool engineered in native C++, we take code safety, memory managem
 
 
 
-\*\*Please do not open a public GitHub Issue for security vulnerabilities.\*\*
+**Please do not open a public GitHub Issue for security vulnerabilities.**
 
 
 
 If you discover a vulnerability, memory leak, or potential bypass in Blade-Antivirus, please follow these steps:
 
-1\. Send a detailed report via email to \*\*bladeyep@gmail.com\*\*.
+1. Send a detailed report via email to \*\*bladeyep@gmail.com\*\*.
 
-2\. Include a description of the vulnerability, a proof of concept (PoC), and steps to reproduce the issue.
+2. Include a description of the vulnerability, a proof of concept (PoC), and steps to reproduce the issue.
 
-3\. If applicable, specify the operating system and compiler options used.
+3. If applicable, specify the operating system and compiler options used.
 
