@@ -34,7 +34,7 @@ As a security tool engineered in native C++, we take code safety, memory managem
 
 If you discover a vulnerability, memory leak, or potential bypass in Blade-Antivirus, please follow these steps:
 
-1. Send a detailed report via email to \*\*bladeyep@gmail.com\*\*.
+1. Send a detailed report via email to **bladeyep@gmail.com**.
 
 2. Include a description of the vulnerability, a proof of concept (PoC), and steps to reproduce the issue.
 
