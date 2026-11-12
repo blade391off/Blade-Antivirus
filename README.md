@@ -26,7 +26,7 @@ BladeAntivirus is a Windows antivirus project built with C++ and Qt Quick. It ai
 - Qt Quick / QML
 - CMake
 - Ninja / MinGW
-- Windows x64
+- Windows x32 + x64
 
 ## Requirements
 
