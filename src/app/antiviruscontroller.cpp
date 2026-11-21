@@ -1,19 +1,27 @@
 #include "antiviruscontroller.h"
+#include "../database/database_locator.h"
 #include "../scanner/scanner.h"
 #include "../updater/updater.h"
 
 #include <QByteArray>
-#include <QCoreApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QStringList>
-#include <QTimer>
+#include <QTextStream>
 #include <QUrl>
+
+#include <windows.h>
+#include <tlhelp32.h>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -40,35 +48,14 @@ namespace
     // The current working directory is never used.
     QString dataDir()
     {
-        return QStandardPaths::writableLocation(
-                   QStandardPaths::AppLocalDataLocation)
-            + "/database";
-    }
-
-    QString bundledDir()
-    {
-        return QCoreApplication::applicationDirPath() + "/database";
+        return QString::fromStdWString(
+            blade::database::userDatabaseDir().wstring());
     }
 
     QString findDatabase()
     {
-        QStringList candidates = {
-            dataDir() + "/hashes.txt",
-            bundledDir() + "/hashes.txt"
-        };
-
-#if defined(BLADE_SOURCE_DIR) && !defined(QT_NO_DEBUG)
-        candidates << QStringLiteral(BLADE_SOURCE_DIR) + "/database/hashes.txt";
-#endif
-
-        for (const QString& path : candidates) {
-            const QFileInfo info(path);
-
-            if (info.isFile())
-                return info.absoluteFilePath();
-        }
-
-        return {};
+        return QString::fromStdWString(
+            blade::database::locateHashes().wstring());
     }
 
     // Lowers CPU, I/O and memory priority of the calling thread so scans and
@@ -139,7 +126,12 @@ namespace
 AntivirusController::AntivirusController(QObject* parent)
     : QObject(parent)
     , m_updateTimer(this)
+    , m_scheduledScanTimer(this)
 {
+    // A database written by an older build lived one level higher; move it
+    // before the first read so an upgrade does not look like "not found".
+    blade::database::migrateLegacyDatabase();
+
     m_updateTimer.setInterval(kAutoUpdateIntervalMs);
     m_updateTimer.setTimerType(Qt::VeryCoarseTimer);
 
@@ -148,6 +140,19 @@ AntivirusController::AntivirusController(QObject* parent)
     });
 
     m_updateTimer.start();
+
+    // Report a missing database right away instead of waiting for the first
+    // scan attempt to fail. Queued so the QML side is already connected.
+    QTimer::singleShot(0, this, [this]() { publishDatabaseStatus(); });
+
+    // Load persisted settings (exclusions, scheduled scan) and wire the
+    // scheduled-scan timer to run a full scan.
+    loadSettings();
+
+    connect(&m_scheduledScanTimer, &QTimer::timeout, this, [this]() {
+        if (!m_scanning.load())
+            startFullScan();
+    });
 
     // First check shortly after launch (also right after login via autostart).
     QTimer::singleShot(kFirstUpdateDelayMs, this, [this]() {
@@ -159,6 +164,12 @@ AntivirusController::AntivirusController(QObject* parent)
     connect(this, &AntivirusController::updateFinished, this, [this](bool ok) {
         if (ok) {
             m_updateFailures = 0;
+
+            // The first successful update turns a silent "missing database"
+            // into a working install; reflect that in the UI.
+            if (!m_databaseAvailable)
+                publishDatabaseStatus();
+
             return;
         }
 
@@ -169,6 +180,30 @@ AntivirusController::AntivirusController(QObject* parent)
 
         QTimer::singleShot(delay, this, [this]() { startUpdate(false); });
     });
+}
+
+bool AntivirusController::databaseAvailable() const
+{
+    return m_databaseAvailable;
+}
+
+void AntivirusController::publishDatabaseStatus()
+{
+    const bool available = !findDatabase().isEmpty();
+
+    if (available != m_databaseAvailable) {
+        m_databaseAvailable = available;
+        emit databaseAvailableChanged();
+    }
+
+    if (available) {
+        emit statusChanged(QStringLiteral("Protection ready"));
+        return;
+    }
+
+    emit statusChanged(QStringLiteral(
+        "Detection database is missing. Run \"Check for updates\" "
+        "to download it."));
 }
 
 AntivirusController::~AntivirusController()
@@ -369,13 +404,15 @@ void AntivirusController::startScan(const QStringList& folders)
 
     m_stopRequested.store(false);
 
+    m_lastScanResults.clear();
+
     const QString databasePath = findDatabase();
 
     if (databasePath.isEmpty()) {
         m_scanning.store(false);
 
         emit scanningChanged();
-        emit statusChanged("Hash database not found. Run \"Check for updates\" or put database/hashes.txt next to the exe.");
+        publishDatabaseStatus();
         return;
     }
 
@@ -403,6 +440,7 @@ void AntivirusController::startScan(const QStringList& folders)
             int errors = 0;
             int skipped = 0;
             bool initFailed = false;
+            QString initDetail;
             QString failure;
 
             QElapsedTimer totalTimer;
@@ -416,6 +454,7 @@ void AntivirusController::startScan(const QStringList& folders)
                         std::filesystem::path(databasePath.toStdWString()),
                         std::filesystem::path(cachePath.toStdWString()))) {
                     initFailed = true;
+                    initDetail = QString::fromStdString(scanner.lastError());
                 }
                 else {
                     emit statusChanged("Scanning files...");
@@ -443,12 +482,26 @@ void AntivirusController::startScan(const QStringList& folders)
                                 break;
 
                             const QString path = it.next();
+
+                            if (isExcluded(path)) {
+                                ++skipped;
+                                continue;
+                            }
+
                             ++scanned;
 
                             const ScanResult result = scanner.scan(
                                 std::filesystem::path(path.toStdWString()));
                             const QString verdict =
                                 QString::fromStdString(result.verdict);
+
+                            // Remember for export / history.
+                            ScanEntry entry;
+                            entry.path = path;
+                            entry.verdict = verdict;
+                            entry.sha256 = QString::fromStdString(result.sha256);
+                            entry.details = QString::fromStdString(result.details);
+                            m_lastScanResults.push_back(entry);
 
                             // Only report interesting files. Emitting a queued
                             // signal per file floods the GUI event loop on a full scan.
@@ -458,7 +511,15 @@ void AntivirusController::startScan(const QStringList& folders)
                                     path,
                                     verdict,
                                     QString::fromStdString(result.sha256),
-                                    "Known malware: SHA-256 is in the blocklist");
+                                    result.details.empty()
+                                        ? QStringLiteral("Known malware: SHA-256 is in the blocklist")
+                                        : QString::fromStdString(result.details));
+
+                                emit threatDetected(
+                                    path, verdict,
+                                    result.details.empty()
+                                        ? QStringLiteral("Known malware: SHA-256 is in the blocklist")
+                                        : QString::fromStdString(result.details));
                             }
                             else if (verdict == "SUSPICIOUS") {
                                 ++suspicious;
@@ -466,6 +527,10 @@ void AntivirusController::startScan(const QStringList& folders)
                                     path,
                                     verdict,
                                     QString::fromStdString(result.sha256),
+                                    QString::fromStdString(result.details));
+
+                                emit threatDetected(
+                                    path, verdict,
                                     QString::fromStdString(result.details));
                             }
                             else if (verdict == "ERROR") {
@@ -491,6 +556,10 @@ void AntivirusController::startScan(const QStringList& folders)
 
                     // Remember clean files so the next scan is much faster.
                     scanner.saveCache();
+
+                    appendScanHistory(
+                        scanned, detected, suspicious, errors, skipped,
+                        totalTimer.elapsed());
                 }
             }
             catch (const std::exception& e) {
@@ -504,8 +573,11 @@ void AntivirusController::startScan(const QStringList& folders)
                 qCritical() << "[BladeAntivirus] scan thread: unknown exception";
             }
 
-            if (initFailed)
-                failure = "Could not load the hash database (missing or empty). Run \"Check for updates\".";
+            if (initFailed) {
+                failure = initDetail.isEmpty()
+                    ? QStringLiteral("Scanner initialization failed. Run \"Check for updates\".")
+                    : QStringLiteral("Scanner initialization failed: %1").arg(initDetail);
+            }
 
             const bool stopped = m_stopRequested.load();
             m_scanning.store(false);
@@ -538,3 +610,220 @@ void AntivirusController::startScan(const QStringList& folders)
         }
     );
 }
+// ===================== NEW FEATURES =====================
+
+QStringList AntivirusController::exclusions() const { return m_exclusions; }
+
+void AntivirusController::addExclusion(const QString& path) {
+    const QString canonical = QFileInfo(path).canonicalFilePath();
+    if (canonical.isEmpty() || m_exclusions.contains(canonical, Qt::CaseInsensitive)) return;
+    m_exclusions.append(canonical);
+    saveSettings();
+    emit exclusionsChanged();
+}
+
+void AntivirusController::removeExclusion(const QString& path) {
+    m_exclusions.removeAll(path);
+    saveSettings();
+    emit exclusionsChanged();
+}
+
+void AntivirusController::clearExclusions() {
+    m_exclusions.clear();
+    saveSettings();
+    emit exclusionsChanged();
+}
+
+bool AntivirusController::isExcluded(const QString& path) const {
+    for (const QString& exclusion : m_exclusions)
+        if (path.startsWith(exclusion, Qt::CaseInsensitive)) return true;
+    return false;
+}
+
+void AntivirusController::startPathsScan(const QStringList& paths) { startScan(paths); }
+
+void AntivirusController::scanRunningProcesses() {
+    QStringList processPaths;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == 0) continue;
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            if (!process) continue;
+            wchar_t buffer[MAX_PATH]; DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(process, 0, buffer, &size)) {
+                const QString path = QString::fromWCharArray(buffer, static_cast<int>(size));
+                if (!path.isEmpty() && !processPaths.contains(path, Qt::CaseInsensitive))
+                    processPaths.append(path);
+            }
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    if (!processPaths.isEmpty()) startScan(processPaths);
+}
+
+QString AntivirusController::quarantineRoot() const { return dataDir() + "/quarantine"; }
+
+bool AntivirusController::quarantineFile(const QString& path) {
+    QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) return false;
+    const QString id = QString::number(QDateTime::currentMSecsSinceEpoch());
+    const QString dir = quarantineRoot() + "/" + id;
+    QDir().mkpath(dir);
+    const QString destination = dir + "/" + info.fileName();
+    if (!QFile::rename(path, destination)) return false;
+    QJsonObject manifest;
+    manifest["id"] = id; manifest["originalPath"] = path;
+    manifest["fileName"] = info.fileName();
+    manifest["quarantinedAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    manifest["size"] = static_cast<qint64>(info.size());
+    QFile mf(dir + "/manifest.json");
+    if (mf.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        mf.write(QJsonDocument(manifest).toJson(QJsonDocument::Indented));
+        mf.close();
+    }
+    return true;
+}
+
+bool AntivirusController::restoreQuarantined(const QString& id) {
+    const QString dir = quarantineRoot() + "/" + id;
+    QFile mf(dir + "/manifest.json");
+    if (!mf.open(QIODevice::ReadOnly)) return false;
+    const QJsonDocument doc = QJsonDocument::fromJson(mf.readAll());
+    mf.close();
+    const QString originalPath = doc.object().value("originalPath").toString();
+    const QString fileName = doc.object().value("fileName").toString();
+    if (originalPath.isEmpty() || fileName.isEmpty()) return false;
+    const QString source = dir + "/" + fileName;
+    if (!QFile::exists(source)) return false;
+    QDir().mkpath(QFileInfo(originalPath).absolutePath());
+    if (!QFile::rename(source, originalPath)) return false;
+    QDir(dir).removeRecursively();
+    return true;
+}
+
+bool AntivirusController::deleteQuarantined(const QString& id) {
+    const QString dir = quarantineRoot() + "/" + id;
+    if (!QDir(dir).exists()) return false;
+    return QDir(dir).removeRecursively();
+}
+
+QStringList AntivirusController::quarantinedFiles() const {
+    QStringList result;
+    QDir root(quarantineRoot());
+    if (!root.exists()) return result;
+    for (const QString& id : root.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QFile mf(root.filePath(id) + "/manifest.json");
+        if (!mf.open(QIODevice::ReadOnly)) continue;
+        const QJsonDocument doc = QJsonDocument::fromJson(mf.readAll());
+        mf.close();
+        const QJsonObject o = doc.object();
+        result.append(QString("%1|%2|%3").arg(id, o.value("fileName").toString(), o.value("originalPath").toString()));
+    }
+    return result;
+}
+
+void AntivirusController::setScheduledScanEnabled(bool enabled) {
+    m_scheduledScanEnabled = enabled;
+    if (enabled) {
+        if (!m_scheduledScanTimer.isActive())
+            m_scheduledScanTimer.start(m_scheduledScanIntervalMinutes * 60 * 1000);
+    } else {
+        m_scheduledScanTimer.stop();
+    }
+    saveSettings();
+    emit scheduledScanEnabledChanged();
+}
+
+void AntivirusController::setScheduledScanIntervalMinutes(int minutes) {
+    if (minutes < 5) minutes = 5;
+    m_scheduledScanIntervalMinutes = minutes;
+    if (m_scheduledScanTimer.isActive())
+        m_scheduledScanTimer.setInterval(minutes * 60 * 1000);
+    saveSettings();
+    emit scheduledScanIntervalMinutesChanged();
+}
+
+bool AntivirusController::scheduledScanEnabled() const { return m_scheduledScanEnabled; }
+int AntivirusController::scheduledScanIntervalMinutes() const { return m_scheduledScanIntervalMinutes; }
+
+bool AntivirusController::exportLastScanReport(const QString& filePath) const {
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
+    QTextStream stream(&file);
+    stream << "path,verdict,sha256,details\n";
+    for (const ScanEntry& entry : m_lastScanResults) {
+        stream << "\"" << entry.path << "\"," << entry.verdict << "," << entry.sha256 << ",\"" << entry.details << "\"\n";
+    }
+    file.close();
+    return true;
+}
+
+QStringList AntivirusController::recentScanHistory() const {
+    QFile file(dataDir() + "/scan_history.json");
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+    QStringList result;
+    for (const QJsonValue& v : doc.array()) {
+        const QJsonObject o = v.toObject();
+        result.append(QString("%1 | %2 files | %3 malicious | %4 suspicious")
+            .arg(o.value("finishedAt").toString())
+            .arg(o.value("scanned").toInt())
+            .arg(o.value("detected").toInt())
+            .arg(o.value("suspicious").toInt()));
+    }
+    return result;
+}
+
+void AntivirusController::appendScanHistory(int scanned, int detected, int suspicious, int errors, int skipped, qint64 elapsedMs) {
+    QFile file(dataDir() + "/scan_history.json");
+    QJsonArray array;
+    if (file.open(QIODevice::ReadOnly)) { array = QJsonDocument::fromJson(file.readAll()).array(); file.close(); }
+    QJsonObject entry;
+    entry["finishedAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    entry["scanned"] = scanned; entry["detected"] = detected;
+    entry["suspicious"] = suspicious; entry["errors"] = errors;
+    entry["skipped"] = skipped; entry["elapsedMs"] = elapsedMs;
+    array.append(entry);
+    while (array.size() > 50) array.removeFirst();
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+        file.close();
+    }
+}
+
+void AntivirusController::loadSettings() {
+    QSettings settings("BladeAntivirus", "BladeAntivirus");
+    m_exclusions = settings.value("exclusions").toStringList();
+    m_scheduledScanEnabled = settings.value("scheduledScanEnabled", false).toBool();
+    m_scheduledScanIntervalMinutes = settings.value("scheduledScanIntervalMinutes", 60).toInt();
+    if (m_scheduledScanEnabled) {
+        m_scheduledScanTimer.setInterval(m_scheduledScanIntervalMinutes * 60 * 1000);
+        m_scheduledScanTimer.setTimerType(Qt::VeryCoarseTimer);
+        m_scheduledScanTimer.start();
+    }
+}
+
+void AntivirusController::saveSettings() {
+    QSettings settings("BladeAntivirus", "BladeAntivirus");
+    settings.setValue("exclusions", m_exclusions);
+    settings.setValue("scheduledScanEnabled", m_scheduledScanEnabled);
+    settings.setValue("scheduledScanIntervalMinutes", m_scheduledScanIntervalMinutes);
+}
+
+void AntivirusController::setRealtimeProtectionEnabled(bool enabled) {
+    if (enabled) {
+        const QString db = findDatabase();
+        const QString cache = dataDir() + "/scan_cache.bin";
+        QStringList dirs;
+        dirs << QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
+        m_realtimeProtection.start(dirs, db, cache);
+    } else {
+        m_realtimeProtection.stop();
+    }
+}
+

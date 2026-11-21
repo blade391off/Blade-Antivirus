@@ -21,6 +21,30 @@ namespace
 
         return s;
     }
+
+    // Extension without the leading dot, lowercased, or "" when it is not
+    // plain ASCII (a Unicode extension is never in our lists anyway).
+    std::string narrowExtension(const std::filesystem::path& path)
+    {
+        const auto ext = fold(path.extension());
+
+        if (ext.size() < 2) // "" or "."
+            return {};
+
+        std::string narrow;
+
+        for (std::size_t i = 1; i < ext.size(); ++i)
+        {
+            const auto ch = ext[i];
+
+            if (ch > 0x7E || ch < 0x20)
+                return {};
+
+            narrow.push_back(static_cast<char>(ch));
+        }
+
+        return narrow;
+    }
 }
 
 bool hasScannableExtension(const std::filesystem::path& path)
@@ -42,24 +66,24 @@ bool hasScannableExtension(const std::filesystem::path& path)
         "zip", "rar", "7z", "iso", "img", "cab"
     };
 
-    const auto ext = fold(path.extension());
+    const std::string extension = narrowExtension(path);
 
-    if (ext.size() < 2) // "" or "."
-        return false;
+    return !extension.empty() && kExtensions.count(extension) != 0;
+}
 
-    std::string narrow;
+bool isCodeExtension(const std::filesystem::path& path)
+{
+    static const std::unordered_set<std::string> kExtensions = {
+        "exe", "dll", "sys", "scr", "com", "pif", "cpl", "ocx", "drv", "efi",
+        "msi", "msp", "mst", "appx", "msix",
+        "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+        "hta", "jar", "jnlp", "reg", "inf", "lnk", "chm",
+        "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "ppam"
+    };
 
-    for (std::size_t i = 1; i < ext.size(); ++i)
-    {
-        const auto ch = ext[i];
+    const std::string extension = narrowExtension(path);
 
-        if (ch > 0x7E || ch < 0x20)
-            return false;
-
-        narrow.push_back(static_cast<char>(ch));
-    }
-
-    return kExtensions.count(narrow) != 0;
+    return !extension.empty() && kExtensions.count(extension) != 0;
 }
 
 bool isInsideDirectory(const std::filesystem::path& path,
@@ -78,5 +102,18 @@ bool isInsideDirectory(const std::filesystem::path& path,
         return false;
 
     return p.size() == d.size() || p[d.size()] == '\\';
+}
+
+bool isInsideAnyDirectory(
+    const std::filesystem::path& path,
+    const std::vector<std::filesystem::path>& directories)
+{
+    for (const auto& directory : directories)
+    {
+        if (!directory.empty() && isInsideDirectory(path, directory))
+            return true;
+    }
+
+    return false;
 }
 }

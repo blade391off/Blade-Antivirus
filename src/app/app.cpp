@@ -8,7 +8,7 @@ namespace Blade
 int App::Run()
 {
 	Scanner scanner;
-	scanner.initialize("");
+	(void)scanner.initialize("");
 	std::cout << "BladeAntivirus scaffold running\n";
 	return 0;
 }

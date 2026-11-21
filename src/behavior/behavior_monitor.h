@@ -1,50 +1,50 @@
 
 #pragma once
 
-#include <cstdint>
+#include <QObject>
+#include <QString>
+
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
-#include <string>
-#include <vector>
+#include <thread>
 
-enum class BehaviorEventType
+class BehaviorMonitor final : public QObject
 {
-    ProcessStarted,
-    AutorunChanged,
-    FileChangeObserved
-};
+    Q_OBJECT
 
-struct BehaviorEvent
-{
-    BehaviorEventType type =
-        BehaviorEventType::ProcessStarted;
+        Q_PROPERTY(bool active READ active NOTIFY activeChanged)
 
-    std::uint32_t processId = 0;
-    std::string processName;
-    std::string details;
-};
-
-struct BehaviorAlert
-{
-    int score = 0;
-    std::uint32_t processId = 0;
-    std::string processName;
-    std::vector<std::string> findings;
-};
-
-class BehaviorMonitor
-{
 public:
-    
-    void recordEvent(const BehaviorEvent& event);
+    explicit BehaviorMonitor(QObject* parent = nullptr);
+    ~BehaviorMonitor() override;
 
-    
-    [[nodiscard]]
-    std::vector<BehaviorAlert> takeAlerts();
+    BehaviorMonitor(const BehaviorMonitor&) = delete;
+    BehaviorMonitor& operator=(const BehaviorMonitor&) = delete;
 
-    void clear();
+    bool active() const;
+
+    Q_INVOKABLE bool start();
+    Q_INVOKABLE void stop();
+
+signals:
+    void activeChanged();
+    void statusChanged(const QString& status);
+
+    void processObserved(
+        quint32 pid,
+        const QString& path,
+        int riskScore,
+        const QString& verdict,
+        const QString& details
+    );
 
 private:
-    mutable std::mutex mutex_;
-    std::vector<BehaviorAlert> alerts_;
-    unsigned consecutiveFileChanges_ = 0;
+    void worker();
+
+    std::atomic_bool m_active{ false };
+
+    std::thread m_worker;
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
 };

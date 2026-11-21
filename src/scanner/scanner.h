@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct ScanResult
 {
@@ -13,42 +14,39 @@ struct ScanResult
 
     bool hashMatch = false;
     bool isPE = false;
+    bool yaraMatch = false;
 
-    // "MALICIOUS"  : SHA-256 is in the blocklist
-    // "SUSPICIOUS" : static PE heuristics scored high and the file is not
-    //                validly signed (see heuristicScore / details)
-    // "CLEAN", "ERROR", "SKIPPED" (cloud placeholder, device, too large)
+    std::vector<std::string> yaraMatches;
+
     std::string verdict;
 
-    int heuristicScore = 0;   // 0 for non-PE files and cache hits
-    std::string details;      // human-readable reasons for SUSPICIOUS
+    int heuristicScore = 0;
+    std::string details;
 
-    // Windows error code when verdict == "ERROR" (0 if not applicable).
     unsigned long winError = 0;
+};
+
+// Per-call limits. Manual scans use the defaults; background (real-time)
+// scans pass tighter values so a single huge file cannot stall the queue.
+struct ScanLimits
+{
+    std::uint64_t maxFileSize = 256ull * 1024 * 1024;
+    std::uint64_t maxAnalyzeSize = 32ull * 1024 * 1024;
+    int yaraTimeoutSeconds = 30;
 };
 
 class HashDetector;
 
-// Detection pipeline per file:
-//   1. scan cache (unchanged clean file -> only the hash is looked up again)
-//   2. SHA-256 blocklist                     -> MALICIOUS
-//   3. static PE analysis (packers, injection APIs, ransom/credential
-//      strings, ...)                          -> score
-//   4. score >= threshold and no valid Authenticode / catalog signature
-//                                             -> SUSPICIOUS
-//
-// Not thread-safe: use one Scanner per thread.
 class Scanner
 {
 public:
-    // Bump when heuristics change: invalidates the on-disk scan cache.
-    static constexpr std::uint32_t kEngineVersion = 1;
+    static constexpr std::uint32_t kEngineVersion = 2;
 
-    // Files above this size are skipped (keeps full scans light).
-    static constexpr std::uint64_t kMaxFileSize = 256ull * 1024 * 1024;
+    static constexpr std::uint64_t kMaxFileSize =
+        256ull * 1024 * 1024;
 
-    // PE files up to this size are kept in memory for heuristic analysis.
-    static constexpr std::uint64_t kMaxAnalyzeSize = 32ull * 1024 * 1024;
+    static constexpr std::uint64_t kMaxAnalyzeSize =
+        32ull * 1024 * 1024;
 
     Scanner();
     ~Scanner();
@@ -56,21 +54,33 @@ public:
     Scanner(const Scanner&) = delete;
     Scanner& operator=(const Scanner&) = delete;
 
-    // Opens the crypto provider, loads the hash database and (optionally)
-    // the scan cache. Returns false if the database is missing or empty.
     [[nodiscard]] bool initialize(
         const std::filesystem::path& databasePath,
         const std::filesystem::path& cachePath = {});
 
-    [[nodiscard]] ScanResult scan(const std::filesystem::path& filePath);
+    // Why the last initialize() failed; empty after a successful one.
+    [[nodiscard]] const std::string& lastError() const;
 
-    // Persists the scan cache (no-op when unchanged or not configured).
+    // False when the YARA ruleset could not be compiled (detection then
+    // falls back to hashes and PE heuristics).
+    [[nodiscard]] bool hasYaraRules() const;
+
+    [[nodiscard]] ScanResult scan(
+        const std::filesystem::path& filePath);
+
+    [[nodiscard]] ScanResult scan(
+        const std::filesystem::path& filePath,
+        const ScanLimits& limits);
+
     void saveCache();
 
     [[nodiscard]] std::size_t databaseSize() const;
 
 private:
     struct Impl;
+
     std::unique_ptr<Impl> impl_;
     std::unique_ptr<HashDetector> detector_;
+
+    std::string m_lastError;
 };

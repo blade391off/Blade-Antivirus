@@ -1,6 +1,7 @@
 
 #include "scan_controller.h"
-#include "scanner.h"
+#include "../database/database_locator.h"
+#include "../scanner/scanner.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -131,41 +132,29 @@ void ScanController::runScan(QString targetPath, bool recursive)
                 Qt::QueuedConnection);
         };
 
-    QString databasePath = QDir(
-        QCoreApplication::applicationDirPath())
-        .filePath(QStringLiteral("database/hashes.txt"));
+    const std::filesystem::path databaseFsPath =
+        blade::database::locateHashes();
 
-    if (!QFileInfo(databasePath).isFile())
+    if (databaseFsPath.empty())
     {
-        const QString currentPath = QDir::current()
-            .filePath(QStringLiteral("database/hashes.txt"));
+        running_.store(false);
+        publishStatus(
+            QStringLiteral("Detection database is missing. Run \"Check for updates\"."));
 
-        if (QFileInfo(currentPath).isFile())
-            databasePath = currentPath;
-        else
-        {
-            running_.store(false);
-            publishStatus(
-                QStringLiteral("Hash database not found: database/hashes.txt"));
+        QMetaObject::invokeMethod(
+            this,
+            [this]()
+            {
+                emit scanFinished(0, 0, false);
+            },
+            Qt::QueuedConnection);
 
-            QMetaObject::invokeMethod(
-                this,
-                [this]()
-                {
-                    emit scanFinished(0, 0, false);
-                },
-                Qt::QueuedConnection);
-
-            return;
-        }
+        return;
     }
 
     publishStatus(QStringLiteral("Preparing scanner"));
 
     Scanner scanner;
-
-    const std::filesystem::path databaseFsPath(
-        databasePath.toStdWString());
 
     if (!scanner.initialize(databaseFsPath))
     {

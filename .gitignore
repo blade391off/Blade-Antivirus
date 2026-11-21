@@ -17,7 +17,11 @@
 *.gen
 *.d
 *.cpp.d
-*.qm
+*.pfx
+*.p12
+*.key
+*.pem
+blade_sign.*
 
 
 /[Oo]ut/
@@ -32,3 +36,13 @@
 /README-local.txt
 /README-github.txt
 /src/appicon.aps
+
+# extra ignores
+/build-*/
+/out/build/
+*.user
+CMakeUserPresets.json
+__pycache__/
+/.venv/
+*.log
+scan_cache.bin

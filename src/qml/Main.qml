@@ -15,6 +15,17 @@ ApplicationWindow {
     title: "BladeAntivirus"
     color: "#0B0E14"
 
+    DropArea {
+        anchors.fill: parent
+        onDropped: {
+            var paths = []
+            for (var i = 0; i < drop.urls.length; ++i)
+                paths.push(drop.urls[i].toString())
+            if (paths.length > 0)
+                antivirusController.startPathsScan(paths)
+        }
+    }
+
     onClosing: function(close) {
         // Hide to the tray instead of quitting; "Exit" lives in the tray menu.
         if (trayAvailable) {
@@ -109,7 +120,7 @@ ApplicationWindow {
 
     property string activePage: "Home"
     property string statusMessage: "Protection ready"
-    property bool realTimeProtection: true
+    property bool realTimeProtection: realtimeProtection ? realtimeProtection.active : false
     property bool automaticUpdates: true
 
     // Scan window state
@@ -1052,7 +1063,7 @@ ApplicationWindow {
 
                                             onToggled: {
                                                 if (modelData.key === "realtime")
-                                                    root.realTimeProtection = checked
+                                                    antivirusController.setRealtimeProtectionEnabled(checked)
                                                 else
                                                     root.automaticUpdates = checked
                                             }

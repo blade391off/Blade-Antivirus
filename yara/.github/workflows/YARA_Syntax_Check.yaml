@@ -1,0 +1,230 @@
+name: YARA Advanced CI
+
+on:
+  push:
+    paths:
+      - '**.yar'
+      - '**.yara'
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - '**.yar'
+      - '**.yara'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  yara-validation:
+    name: Validate YARA Rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Debug YARA Files
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "          YARA FILE DEBUG"
+          echo "========================================"
+          echo
+          echo "Current directory: $(pwd)"
+          echo
+          echo "Repository root:"
+          ls -la
+          echo
+
+          for dir in "./Trojans" "./Trojans/RAT" "./WinLock"; do
+            if [ -d "$dir" ]; then
+              echo "Contents of $dir:"
+              ls -la "$dir"
+            else
+              echo "⚠️ Directory $dir does not exist."
+            fi
+            echo
+          done
+
+          echo "Checking required files:"
+          echo
+
+          for file in \
+            "./Trojans/Emotet.yar" \
+            "./Trojans/Fake_Antivirus.yar" \
+            "./Trojans/MEMZ_Trojan.yar" \
+            "./Trojans/ZEUS.yar" \
+            "./Trojans/RAT/AsyncRAT.yar" \
+            "./Trojans/RAT/DarkComet.yar" \
+            "./Trojans/RAT/NjRAT.yar" \
+            "./Trojans/RAT/QuasarRAT.yar" \
+            "./WinLock/NavalnyPass_2000.yar" \
+            "./WinLock/Winlock_uxCryptor.yar"
+          do
+            if [ -f "$file" ]; then
+              echo "✅ EXISTS: $file"
+            else
+              echo "❌ MISSING: $file"
+            fi
+          done
+
+          echo
+          echo "========================================"
+
+      - name: Install YARA
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yara
+
+      - name: Show YARA Version
+        run: |
+          echo "========================================"
+          echo "             YARA VERSION"
+          echo "========================================"
+          yara --version
+          echo
+
+      - name: Validate Individual YARA Rules
+        shell: bash
+        run: |
+          set +e
+
+          FAILED=0
+          TOTAL=0
+          PASSED=0
+          FAILED_FILES=0
+          ERRORS=0
+
+          EMPTY_TARGET=$(mktemp)
+
+          echo "========================================"
+          echo "      INDIVIDUAL YARA VALIDATION"
+          echo "========================================"
+          echo
+
+          while IFS= read -r -d '' rule_file; do
+
+            TOTAL=$((TOTAL + 1))
+
+            if [ "$rule_file" = "./index.yar" ]; then
+              TOTAL=$((TOTAL - 1))
+              continue
+            fi
+
+            echo "----------------------------------------"
+            echo "FILE: $rule_file"
+            echo "----------------------------------------"
+
+            OUTPUT=$(yara -w "$rule_file" "$EMPTY_TARGET" 2>&1)
+            STATUS=$?
+
+            if [ "$STATUS" -eq 0 ]; then
+              echo "STATUS: ✅ VALID"
+              PASSED=$((PASSED + 1))
+            else
+              echo "STATUS: ❌ INVALID"
+              FAILED=1
+              FAILED_FILES=$((FAILED_FILES + 1))
+              echo
+
+              FILE_ERRORS=0
+              while IFS= read -r error_line; do
+                [ -z "$error_line" ] && continue
+                if [[ "$error_line" =~ :([0-9]+):[[:space:]]*(.*) ]] || [[ "$error_line" =~ \(([0-9]+)\):[[:space:]]*(.*) ]]; then
+                  LINE="${BASH_REMATCH[1]}"
+                  MESSAGE="${BASH_REMATCH[2]}"
+                  echo "ERROR: Line $LINE -> $MESSAGE"
+                  ERRORS=$((ERRORS + 1))
+                  FILE_ERRORS=$((FILE_ERRORS + 1))
+                else
+                  echo "ERROR: $error_line"
+                  ERRORS=$((ERRORS + 1))
+                  FILE_ERRORS=$((FILE_ERRORS + 1))
+                fi
+              done <<< "$OUTPUT"
+              echo
+              echo "ERRORS IN FILE: $FILE_ERRORS"
+            fi
+            echo
+
+          done < <(
+            find . \
+              -type f \
+              \( -name "*.yar" -o -name "*.yara" \) \
+              -not -path "./.git/*" \
+              -print0 | sort -z
+          )
+
+          echo
+          echo "========================================"
+          echo "              INDEX VALIDATION"
+          echo "========================================"
+          echo
+
+          if [ -f "./index.yar" ]; then
+            TOTAL=$((TOTAL + 1))
+            echo "----------------------------------------"
+            echo "FILE: ./index.yar"
+            echo "----------------------------------------"
+
+            INDEX_OUTPUT=$(yara -w ./index.yar "$EMPTY_TARGET" 2>&1)
+            INDEX_STATUS=$?
+
+            if [ "$INDEX_STATUS" -eq 0 ]; then
+              echo "STATUS: ✅ VALID"
+              PASSED=$((PASSED + 1))
+            else
+              echo "STATUS: ❌ INVALID"
+              FAILED=1
+              FAILED_FILES=$((FAILED_FILES + 1))
+              echo
+
+              INDEX_ERRORS=0
+              while IFS= read -r error_line; do
+                [ -z "$error_line" ] && continue
+                if [[ "$error_line" =~ :([0-9]+):[[:space:]]*(.*) ]] || [[ "$error_line" =~ \(([0-9]+)\):[[:space:]]*(.*) ]]; then
+                  LINE="${BASH_REMATCH[1]}"
+                  MESSAGE="${BASH_REMATCH[2]}"
+                  echo "ERROR: Line $LINE -> $MESSAGE"
+                  ERRORS=$((ERRORS + 1))
+                  INDEX_ERRORS=$((INDEX_ERRORS + 1))
+                else
+                  echo "ERROR: $error_line"
+                  ERRORS=$((ERRORS + 1))
+                  INDEX_ERRORS=$((INDEX_ERRORS + 1))
+                fi
+              done <<< "$INDEX_OUTPUT"
+              echo
+              echo "ERRORS IN INDEX: $INDEX_ERRORS"
+            fi
+          else
+            echo "STATUS: ⚠️ index.yar NOT FOUND"
+          fi
+
+          rm -f "$EMPTY_TARGET"
+
+          echo
+          echo "========================================"
+          echo "               SUMMARY"
+          echo "========================================"
+          echo
+          echo "Total files evaluated : $TOTAL"
+          echo "Valid files           : $PASSED"
+          echo "Failed files          : $FAILED_FILES"
+          echo "Total errors found    : $ERRORS"
+          echo
+          echo "========================================"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo
+            echo "❌ YARA VALIDATION FAILED"
+            echo "Fix the errors listed above."
+            echo
+            exit 1
+          fi
+
+          echo
+          echo "✅ ALL YARA RULES ARE VALID"
+          echo

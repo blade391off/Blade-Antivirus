@@ -1,0 +1,13 @@
+.env
+.env.local
+secrets.txt
+notes.txt
+todo.txt
+*.tmp
+*.exe
+*.bin
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

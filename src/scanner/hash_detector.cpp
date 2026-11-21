@@ -36,9 +36,25 @@ namespace
         return value;
     }
 
+    bool isValidSha256(const std::string& hash)
+    {
+        if (hash.size() != 64)
+            return false;
+
+        return std::all_of(
+            hash.begin(),
+            hash.end(),
+            [](unsigned char c)
+            {
+                return std::isxdigit(c) != 0;
+            }
+        );
+    }
+
     std::string digestToHex(const HashDetector::Digest& digest)
     {
         std::ostringstream stream;
+
         stream << std::hex << std::setfill('0');
 
         for (const unsigned char byte : digest)
@@ -58,7 +74,15 @@ bool HashDetector::loadDatabase(const std::string& path)
 
 bool HashDetector::loadDatabase(const std::filesystem::path& path)
 {
-    std::ifstream file(path);
+    std::error_code ec;
+
+    if (!std::filesystem::exists(path, ec) || ec)
+        return false;
+
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return false;
+
+    std::ifstream file(path, std::ios::in);
 
     if (!file.is_open())
         return false;
@@ -70,32 +94,29 @@ bool HashDetector::loadDatabase(const std::filesystem::path& path)
     {
         line = normalizeHash(std::move(line));
 
-        if (line.size() != 64)
+        if (!isValidSha256(line))
             continue;
 
-        const bool valid = std::all_of(
-            line.begin(),
-            line.end(),
-            [](unsigned char c)
-            {
-                return std::isxdigit(c) != 0;
-            }
-        );
-
-        if (valid)
-            loadedHashes.insert(std::move(line));
+        loadedHashes.insert(std::move(line));
     }
 
     if (file.bad())
         return false;
 
+    if (loadedHashes.empty())
+        return false;
+
     hashes = std::move(loadedHashes);
+
     return true;
 }
 
 bool HashDetector::contains(const std::string& sha256) const
 {
     const std::string normalized = normalizeHash(sha256);
+
+    if (!isValidSha256(normalized))
+        return false;
 
     return hashes.find(normalized) != hashes.end();
 }
